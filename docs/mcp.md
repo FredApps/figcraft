@@ -244,6 +244,9 @@ Or in a project's `.mcp.json`:
   `fade`, `reset`) or one saved in the file, with any `filters` values on top.
   `image.savePreset {name, filters?}` saves the current (or given) adjustments in the file,
   `image.deletePreset {name}` removes one and `image.presets` lists both kinds.
+  `image.crop {ids?, index?}` (one layer) switches its top visible image fill (or fill `index`) to
+  Crop, keeping the picture where it was, and returns `{id, index}`; the app also enters crop mode
+  on the canvas. The crop itself is the paint's `crop` transform (`fill.set`).
 - Text props (`fontFamily`, `fontStyle`, `fontSize`, `lineHeight`, `letterSpacing`, `textDecoration`,
   `textCase`, `textFills`, `fontVariations`…) apply to the whole layer, or to chars `start`..`end`
   when given (`text.style {id, start, end, …}` does the same). Styled ranges come back as
@@ -252,7 +255,14 @@ Or in a project's `.mcp.json`:
   `text.setVariations {variations, replace?}` merges instead. `text.fonts {family, style?, axes: true}`
   lists a font's axes and named instances (named instances are also valid `fontStyle` values).
   `text.missingFonts` lists the families the document names that aren't installed
-  (`{families: [{family, layers}]}`); their text draws in a fallback font. Fonts are indexed once
+  (`{families: [{family, layers, source}]}`); their text draws in a fallback font. On the desktop,
+  `font.download {family}` installs a family whose `source` isn't null (Google Fonts, Noto) from
+  the font store, in the background: pinned, checksum-verified files into the Craft apps' shared
+  font folder. It works only while the user has allowed downloading fonts, which only the user can
+  do, in the app's Missing fonts window; otherwise it is refused. Call it again for its progress
+  (`{state: downloading, done, total}`); once installed, the call fits the open document's text to
+  the font (`{state: installed, refitted}`). `font.downloads` lists the downloads and whether
+  downloading is allowed (`{allowed, downloads: [{family, state, error?}]}`). Fonts are indexed once
   per process: after installing one, `text.rescanFonts` picks it up (`{added: [families]}`), and
   `text.loadFont {path | data (base64)}` adds a font file without installing it (`{families}`).
   Text boxes keep the size they were measured at: both refit the open document's auto-sizing text
