@@ -1,0 +1,16 @@
+{
+  "base": "e04c5d2274329587b9213f27ad8f88708ea77748",
+  "head": "c7fb4e33df4b65a39832b00442e504e4a64c9008",
+  "platforms": [],
+  "policy": "review-ci-v2.2-no-sonar",
+  "pr": 1699,
+  "repository": "storytold/figcraft",
+  "source_tree": "7a0ad2251d001e82b0aad5b8c6102b21cc206c81",
+  "workflows": {
+    ".github/workflows/ci.yml": "97303a4923458aac1f15c5cd1b437cc889ed886f70976fba549c0e438c617e67",
+    ".github/workflows/freebsd.yml": "d05485ce1ca5afaebf387a2220da3370cc70c4d83e382832c83fddeac26df4d1",
+    ".github/workflows/nix.yml": "209d5edd83df13de7c96a0fde5cf2952f3d7cd5e435be345664b249672894625",
+    ".github/workflows/packaging-lint.yml": "c406806239247909d9ead35c350dace9a31bbb4df39cd5b75f3f8f78be29424b",
+    ".github/workflows/windows-arm64.yml": "2425fd6f99621e1aab343bbbc4405405b15b65a8462eb8261b0d2e9d5b295500"
+  }
+}
