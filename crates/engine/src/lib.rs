@@ -211,6 +211,8 @@ mod board_connector_tests;
 #[cfg(test)]
 mod board_grid_tests;
 #[cfg(test)]
+mod board_reshape_tests;
+#[cfg(test)]
 mod board_table_paste_tests;
 #[cfg(test)]
 mod board_tables_tests;
@@ -261,11 +263,15 @@ mod components_behaviour_tests;
 #[cfg(test)]
 mod components_scale_tests;
 #[cfg(test)]
+mod connector_anywhere_tests;
+#[cfg(test)]
 mod convert_container_tests;
 #[cfg(test)]
 mod cursor_tests;
 #[cfg(test)]
 mod dark_page_text_tests;
+#[cfg(test)]
+mod dash_cap_tests;
 #[cfg(test)]
 mod datafill_tests;
 #[cfg(test)]
@@ -308,6 +314,8 @@ mod export_bench_tests;
 mod export_depth_tests;
 #[cfg(test)]
 mod extended_chain_tests;
+#[cfg(test)]
+mod eyedropper_create_tests;
 #[cfg(test)]
 mod facilitate_tests;
 #[cfg(test)]
@@ -352,6 +360,8 @@ mod huge_stroke_tests;
 mod id_params_behaviour_tests;
 #[cfg(test)]
 mod image_crop_tests;
+#[cfg(test)]
+mod image_readable_tests;
 #[cfg(test)]
 mod images_left_in_file_tests;
 #[cfg(test)]
@@ -607,11 +617,17 @@ mod version_tests;
 #[cfg(test)]
 mod view_behaviour_tests;
 #[cfg(test)]
+mod vote_history_tests;
+#[cfg(test)]
 mod vue_codegen_tests;
 #[cfg(test)]
 mod widget_hover_tests;
 #[cfg(test)]
 mod widget_input_tests;
+#[cfg(test)]
+mod widget_panel_tests;
+#[cfg(test)]
+mod widget_shapes_tests;
 #[cfg(test)]
 mod widgets_tests;
 

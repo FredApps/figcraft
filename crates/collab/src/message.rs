@@ -1,6 +1,8 @@
 //! Messages between clients and the session server, and their two encodings: a compact binary form
 //! (a version byte, then postcard) and a JSON form for debugging and agents.
 
+use std::io::{Read, Write};
+
 use figcraft_doc::NodeId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -27,9 +29,14 @@ pub const HOSTING: &str = "hosting";
 /// reads [`Access::Comment`]: older ones get a comment link as a view link.
 pub const COMMENTS: &str = "comments";
 
+/// The word a client puts in its [`Hello::client_version`] when it reads [`CatchUp::Packed`]: a
+/// server compresses the document in a welcome only for clients that say so (older ones couldn't
+/// read it).
+pub const PACKED: &str = "packed";
+
 /// The `client_version` this build announces: its version, then what it reads beyond the protocol.
 pub fn client_version() -> String {
-    format!("{} {SIGNALS} {HOSTING} {COMMENTS}", env!("CARGO_PKG_VERSION"))
+    format!("{} {SIGNALS} {HOSTING} {COMMENTS} {PACKED}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Whether `client_version` announces `word`.
@@ -50,6 +57,11 @@ pub fn reads_hosting(client_version: &str) -> bool {
 /// A [`Hello::client_version`] that announces [`COMMENTS`].
 pub fn reads_comments(client_version: &str) -> bool {
     announces(client_version, COMMENTS)
+}
+
+/// A [`Hello::client_version`] that announces [`PACKED`].
+pub fn reads_packed(client_version: &str) -> bool {
+    announces(client_version, PACKED)
 }
 
 /// Join a file's session.
@@ -317,6 +329,10 @@ pub enum CatchUp {
     Snapshot(Vec<Change>),
     /// The batches a reconnecting client missed, in order.
     Delta(Vec<Accepted>),
+    /// A [`Snapshot`](CatchUp::Snapshot) compressed ([`pack`]), for a client whose hello announced
+    /// [`PACKED`]: a document's changes shrink several times over. The client reads it with
+    /// [`unpack`] before anything else sees the welcome.
+    Packed(Vec<u8>),
 }
 
 /// Opens a connection that manages a server's files (instead of [`Hello`]): the server's admin
@@ -601,6 +617,18 @@ pub struct Usage {
     pub components: Vec<(NodeId, u32)>,
 }
 
+/// Most styles and most variables of one library one file reports using.
+pub const MAX_ASSET_USAGE: usize = 250;
+
+/// How many layers of one file use each of a library's styles and variables, as its app reports
+/// them: the file's name and the counts (by their ids in the library).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetUsage {
+    pub file: String,
+    pub styles: Vec<(String, u32)>,
+    pub variables: Vec<(String, u32)>,
+}
+
 /// A file's last usage report, with when it came (seconds since 1970, UTC).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileUsage {
@@ -623,6 +651,17 @@ pub struct FileDetached {
     pub updated: u64,
 }
 
+/// What happened to one library component in one week (the week starting `week`, seconds since
+/// 1970 UTC, a Monday at 00:00), over every file that reported it: instances inserted (placed,
+/// pasted or duplicated) and detached, counted when the server first heard of them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeekActions {
+    pub week: u64,
+    pub component: NodeId,
+    pub insertions: u32,
+    pub detachments: u32,
+}
+
 /// A request on a library connection; each gets one [`LibraryReply`], in order.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -642,6 +681,17 @@ pub enum LibraryReq {
     ReportDetached(Detached),
     /// The detach reports of the files that use the library.
     Detached,
+    /// How many instances of each library component the asking file has inserted (a
+    /// [`Detached`]-shaped report of its totals; answered with [`LibraryReply::Noted`]).
+    ReportInserted(Detached),
+    /// The library's components' insertions and detachments week by week (answered with
+    /// [`LibraryReply::Actions`]).
+    Actions,
+    /// How many layers of the asking file use the library's styles and variables (answered with
+    /// [`LibraryReply::Noted`]).
+    ReportAssets(AssetUsage),
+    /// The style and variable reports of the files that use the library.
+    Assets,
 }
 
 /// The answer to a [`LibraryReq`] (the first one on a connection answers [`OpenLibrary`]).
@@ -675,6 +725,8 @@ pub enum LibraryReply {
     /// A report was kept.
     Noted,
     Detached(Vec<FileDetached>),
+    Actions(Vec<WeekActions>),
+    Assets(Vec<AssetUsage>),
 }
 
 /// Opens a connection to a server's plugin directory (instead of [`Hello`]). Anyone who can reach
@@ -926,11 +978,53 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8], max_bytes: usize) -> Result<T, 
     if version != WIRE_VERSION {
         return Err(Error::Decode(format!("wire version {version}, expected {WIRE_VERSION}")));
     }
+    from_postcard(body)
+}
+
+/// One postcard value that fills `body` (no trailing bytes).
+fn from_postcard<T: DeserializeOwned>(body: &[u8]) -> Result<T, Error> {
     let (msg, rest) = postcard::take_from_bytes::<T>(body).map_err(|e| Error::Decode(e.to_string()))?;
     if !rest.is_empty() {
         return Err(Error::Decode(format!("{} bytes after the message", rest.len())));
     }
     Ok(msg)
+}
+
+/// Compress the document in a welcome ([`CatchUp::Packed`]), for a client that announced
+/// [`PACKED`]. Anything else, a catch-up by the missed batches too, is left as it is. Deflate at
+/// its fastest level: the hub packs on its own thread, and a document's changes still shrink
+/// about eightfold.
+pub fn pack(msg: &mut ServerMsg) -> Result<(), Error> {
+    if let ServerMsg::Welcome { catch_up, .. } = msg
+        && let CatchUp::Snapshot(changes) = catch_up
+    {
+        let raw = postcard::to_allocvec(changes).map_err(|e| Error::Encode(e.to_string()))?;
+        let mut z = flate2::write::DeflateEncoder::new(Vec::with_capacity(raw.len() / 4), flate2::Compression::fast());
+        z.write_all(&raw).map_err(|e| Error::Encode(e.to_string()))?;
+        *catch_up = CatchUp::Packed(z.finish().map_err(|e| Error::Encode(e.to_string()))?);
+    }
+    Ok(())
+}
+
+/// Undo [`pack`]: a welcome's packed document back as its changes, refused once it would grow
+/// past `max_bytes` (untrusted input: the limit an unpacked welcome would have had to fit).
+/// Anything else is left as it is.
+pub fn unpack(msg: &mut ServerMsg, max_bytes: usize) -> Result<(), Error> {
+    if let ServerMsg::Welcome { catch_up, .. } = msg
+        && let CatchUp::Packed(packed) = catch_up
+    {
+        let mut raw = Vec::new();
+        let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX).saturating_add(1);
+        flate2::read::DeflateDecoder::new(packed.as_slice())
+            .take(limit)
+            .read_to_end(&mut raw)
+            .map_err(|e| Error::Decode(format!("packed document: {e}")))?;
+        if raw.len() > max_bytes {
+            return Err(Error::TooLarge(max_bytes));
+        }
+        *catch_up = CatchUp::Snapshot(from_postcard(&raw)?);
+    }
+    Ok(())
 }
 
 /// The JSON form of `msg` (`{"<type>": {…}}`).
