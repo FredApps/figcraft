@@ -5,10 +5,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use figcraft_doc::{Collection, Document, ImportedComponent, ImportedRecord, LibraryLink, LibraryManifest, NodeId, PublishedLibrary, VariableId};
+use figcraft_doc::{Document, ImportedComponent, ImportedRecord, LibraryLink, LibraryManifest, NodeId, PublishedLibrary, VariableId};
 use serde_json::{Value, json};
 
-use figcraft_collab::message::{FileDetached, LibraryReply, LibraryReq};
+use figcraft_collab::message::{AssetUsage, FileDetached, LibraryReply, LibraryReq, WeekActions};
 
 use super::CommandSpec;
 use crate::library::{
@@ -60,7 +60,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "library.usage",
             "Library usage",
-            "{library? (an enabled team library: id, name or link; omit for this file's library on its server)}  → what files report: {id, name, instances, detached, detachesKnown (false: the server keeps no detaches), files: [{name, updated, instances, detached}], components: [{id, name, instances, files, detached}]}; a detach is an instance of the component a file detached",
+            "{library? (an enabled team library: id, name or link; omit for this file's library on its server), days? (the period insertions and detachments are counted over: 1–365, default 30)}  → what files report: {id, name, instances, detached, detachesKnown (false: the server keeps no detaches), days, insertions, detachments, actionsKnown (false: the server keeps no weekly counts), weeks: [{week (its Monday, seconds since 1970 UTC), insertions, detachments}], files: [{name, updated, instances, detached}], components: [{id, name, instances, files, detached, insertions, detachments}]}; `detached` is every instance a file has detached, `insertions` and `detachments` those of the weeks in the period (an insertion is an instance placed, pasted or duplicated)",
             false,
             usage_cmd
         ),
@@ -283,13 +283,7 @@ fn extend(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = s.doc_mut()?;
     let map = import_variables(doc, &lib, &vars, &BTreeSet::from([coll.id.clone()]), false);
     let parent = map.collections.get(&coll.id).cloned().ok_or_else(|| EngineError::Other("the collection didn't import".into()))?;
-    let base = string(p, "name").map(|n| n.trim().chars().take(200).collect::<String>()).filter(|n| !n.is_empty());
-    let base = base.unwrap_or_else(|| format!("{} (extended)", coll.name));
-    let name = super::variables::free_collection_name(doc, &base);
-    let id = doc.new_collection_id();
-    doc.variables.collections.push(Collection { id: id.clone(), name, modes: Vec::new(), extends: Some(parent) });
-    super::variables::sync_extensions(doc);
-    Ok(json!({"id": id}))
+    Ok(json!({"id": super::variables::add_extension(doc, parent, &coll.name, p)}))
 }
 
 /// What `p` asks `cmd` to publish of `doc` (`include`, else the default after `prev`; less
@@ -433,6 +427,15 @@ fn usage_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         other => return Err(unexpected(&other)),
     };
     let detached = detach_reports(s.library_request(&link, LibraryReq::Detached))?;
+    let assets = asset_reports(s.library_request(&link, LibraryReq::Assets))?;
+    let days = num(p, "days").filter(|d| d.is_finite()).map_or(30, |d| d.round().clamp(1.0, 365.0) as u64);
+    // Weeks overlapping the period; a server from before weekly counts refuses the request.
+    let since = crate::cmd::comment::now_secs().saturating_sub(days * 86_400);
+    let weeks = match s.library_request(&link, LibraryReq::Actions) {
+        Ok(LibraryReply::Actions(w)) => Some(w.into_iter().filter(|w| w.week.saturating_add(7 * 86_400) > since).collect::<Vec<_>>()),
+        Err(EngineError::Waiting) => return Err(EngineError::Waiting),
+        _ => None,
+    };
     let m = &lib.manifest;
     // Component → (instances, files using it, instances detached).
     let mut per: std::collections::BTreeMap<NodeId, (u64, u64, u64)> = std::collections::BTreeMap::new();
@@ -451,11 +454,18 @@ fn usage_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     for (c, k) in detached.iter().flatten().flat_map(|d| &d.detached.components) {
         per.entry(*c).or_default().2 += u64::from(*k);
     }
+    let actions = period_actions(weeks.as_deref().unwrap_or_default());
+    for c in actions.per.keys() {
+        per.entry(*c).or_default();
+    }
     let mut comps: Vec<(NodeId, (u64, u64, u64))> = per.into_iter().collect();
     comps.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(b.1.2.cmp(&a.1.2)).then(a.0.cmp(&b.0)));
     let components: Vec<Value> = comps
         .iter()
-        .map(|(c, (n, f, d))| json!({"id": c, "name": m.component(*c).map(|a| a.name.clone()), "instances": n, "files": f, "detached": d}))
+        .map(|(c, (n, f, d))| {
+            let (ins, det) = actions.per.get(c).copied().unwrap_or_default();
+            json!({"id": c, "name": m.component(*c).map(|a| a.name.clone()), "instances": n, "files": f, "detached": d, "insertions": ins, "detachments": det})
+        })
         .collect();
     Ok(json!({
         "id": m.id,
@@ -463,9 +473,76 @@ fn usage_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         "instances": comps.iter().map(|c| c.1.0).sum::<u64>(),
         "detached": comps.iter().map(|c| c.1.2).sum::<u64>(),
         "detachesKnown": detached.is_some(),
+        "days": days,
+        "insertions": actions.insertions,
+        "detachments": actions.detachments,
+        "actionsKnown": weeks.is_some(),
+        "weeks": actions.weeks,
         "files": rows,
         "components": components,
+        "assetsKnown": assets.is_some(),
+        "styles": asset_rows(assets.iter().flatten().map(|a| &a.styles), |id| {
+            m.style(id).map(|x| json!({"name": x.name, "type": x.kind}))
+        }),
+        "variables": asset_rows(assets.iter().flatten().map(|a| &a.variables), |id| {
+            let v = m.variable(id)?;
+            Some(json!({"name": v.name, "collection": m.collection(&v.collection).map(|c| c.name.clone())}))
+        }),
     }))
+}
+
+/// The style or variable reports' totals, the most used first: each one's `id`, `layers` and
+/// `files`, with what `describe` says of it (nothing for one no longer published).
+fn asset_rows<'a>(reports: impl Iterator<Item = &'a Vec<(String, u32)>>, describe: impl Fn(&str) -> Option<Value>) -> Vec<Value> {
+    let mut per = std::collections::BTreeMap::<&str, (u64, u64)>::new();
+    for (id, n) in reports.flatten() {
+        let e = per.entry(id).or_default();
+        e.0 += u64::from(*n);
+        e.1 += 1;
+    }
+    let mut rows: Vec<_> = per.into_iter().collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1.0));
+    let row = |(id, (layers, files)): (&str, (u64, u64))| {
+        let mut r = describe(id).unwrap_or_else(|| json!({}));
+        (r["id"], r["layers"], r["files"]) = (json!(id), json!(layers), json!(files));
+        r
+    };
+    rows.into_iter().map(row).collect()
+}
+
+/// The style and variable reports, `None` from a server from before them.
+fn asset_reports(reply: Result<LibraryReply>) -> Result<Option<Vec<AssetUsage>>> {
+    match reply {
+        Ok(LibraryReply::Assets(a)) => Ok(Some(a)),
+        Err(EngineError::Waiting) => Err(EngineError::Waiting),
+        _ => Ok(None),
+    }
+}
+
+/// A period's insertions and detachments: per component, in all, and week by week (ascending).
+struct PeriodActions {
+    per: std::collections::BTreeMap<NodeId, (u64, u64)>,
+    insertions: u64,
+    detachments: u64,
+    weeks: Vec<Value>,
+}
+
+fn period_actions(rows: &[WeekActions]) -> PeriodActions {
+    let mut per: std::collections::BTreeMap<NodeId, (u64, u64)> = std::collections::BTreeMap::new();
+    let mut weeks: std::collections::BTreeMap<u64, (u64, u64)> = std::collections::BTreeMap::new();
+    for r in rows {
+        let (ins, det) = (u64::from(r.insertions), u64::from(r.detachments));
+        for e in [per.entry(r.component).or_default(), weeks.entry(r.week).or_default()] {
+            e.0 += ins;
+            e.1 += det;
+        }
+    }
+    PeriodActions {
+        insertions: per.values().map(|v| v.0).sum(),
+        detachments: per.values().map(|v| v.1).sum(),
+        weeks: weeks.into_iter().map(|(week, (i, d))| json!({"week": week, "insertions": i, "detachments": d})).collect(),
+        per,
+    }
 }
 
 /// The detach reports a server keeps; `None` from a server from before they were kept (it refuses
@@ -594,6 +671,11 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
         }
         None => doc.libraries.enabled.iter().filter(|l| is_server_link(&l.path)).map(|l| l.path.clone()).collect(),
     };
+    // Confined to automation roots, nothing is checked (#1095): say so, and don't remember the
+    // libraries as yours either.
+    if let (false, Some(why)) = (links.is_empty(), crate::file_access::network_refused()) {
+        return Err(EngineError::Disabled(cmd.to_string(), why));
+    }
     for l in &links {
         s.allow_library(l);
     }

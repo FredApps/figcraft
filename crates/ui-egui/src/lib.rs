@@ -90,6 +90,8 @@ mod crop_image_tests;
 #[cfg(test)]
 mod cursors_tests;
 #[cfg(test)]
+mod dash_pattern_tests;
+#[cfg(test)]
 mod design_paste_tests;
 #[cfg(test)]
 mod dev_mode_tests;
@@ -223,6 +225,8 @@ mod proto_responsive_tests;
 #[cfg(test)]
 mod resources_tests;
 #[cfg(test)]
+mod sampled_color_tests;
+#[cfg(test)]
 mod save_as_tests;
 #[cfg(test)]
 mod select_all_tests;
@@ -259,6 +263,10 @@ mod vector_panel_tests;
 #[cfg(test)]
 mod vector_tail_ui_tests;
 #[cfg(test)]
+mod vote_history_ui_tests;
+#[cfg(test)]
+mod vote_voters_tests;
+#[cfg(test)]
 mod web_clipboard_tests;
 #[cfg(test)]
 mod web_save_tests;
@@ -286,6 +294,7 @@ pub use dialogs::credits;
 pub use dialogs::import_report;
 pub use dialogs::missing_fonts;
 pub use dialogs::plugins_ui;
+pub use dialogs::sampled_color;
 pub use dialogs::updates_ui;
 pub use dialogs::variables_panel;
 pub use home::home_recents;
@@ -500,6 +509,8 @@ pub struct UiState {
     /// Files the user opened whose fonts are yet to be checked (by document uid).
     pub font_checks: Vec<u64>,
     pub missing_fonts: Option<missing_fonts::Shown>,
+    /// The eyedropper's Cmd/Ctrl+Shift pick, to make a colour style or variable of.
+    pub sampled_color: Option<sampled_color::SampledColor>,
     pub screenshot_requests: Vec<(u64, String)>,
     pub frame_ms: f64,
     pub render_ms: f64,
@@ -550,12 +561,6 @@ pub struct UiState {
     /// copy changes the engine clipboard without writing the OS clipboard; the generation then
     /// no longer matches, so the stale mirror is not mistaken for the user's own copy.
     pub last_copy_generation: u64,
-    /// Since the last V key release: whether its press arrived, and whether a paste event did
-    /// (`shortcuts::swallowed_paste`).
-    pub v_pressed: bool,
-    pub paste_event: bool,
-    /// The window got the focus back since the last V release.
-    pub refocused: bool,
     /// A save shortcut pressed while a panel field had the keyboard: the field lets go (which
     /// commits what was typed) and the command runs next frame for that document/window.
     pub after_field: Option<shortcuts::AfterFieldSave>,
@@ -667,6 +672,7 @@ impl Default for UiState {
             import_report: None,
             font_checks: Vec::new(),
             missing_fonts: None,
+            sampled_color: None,
             screenshot_requests: Vec::new(),
             frame_ms: 0.0,
             render_ms: 0.0,
@@ -694,9 +700,6 @@ impl Default for UiState {
 
             last_copy: None,
             last_copy_generation: 0,
-            v_pressed: false,
-            paste_event: false,
-            refocused: false,
             after_field: None,
             held: egui::Modifiers::NONE,
             next_autosave: 0.0,
