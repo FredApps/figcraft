@@ -30,6 +30,9 @@ pub struct Ctx<'a, 'd> {
     pub skip: &'a [NodeId],
     /// Approximate what's too small to see in detail (canvas previews; see [`crate::lod`]).
     pub lod: bool,
+    /// A canvas preview at any zoom ([`crate::Options::lod`]): large images shown smaller than
+    /// their pixels draw from smaller copies (see [`crate::images::shown`]).
+    pub preview: bool,
     pub magnified_image_pixels: bool,
     /// The surfaces under the one being drawn into, when it is an isolated layer (for backdrops).
     pub under: Option<&'a Under<'a>>,
@@ -130,7 +133,7 @@ fn pixels_when_magnified(prep: Prepared, device_scale: f64) -> Prepared {
 fn fill_with(pix: &mut Pixmap, path: &tiny_skia::Path, paints: &[Paint], w: f64, h: f64, xf: Affine, rule: FillRule, ctx: &Ctx, mask: Option<&Mask>) {
     let scale = xf.determinant().abs().sqrt();
     for p in paints {
-        let Some(prep) = prepare_at(p, w, h, scale, ctx.doc, ctx.time) else { continue };
+        let Some(prep) = prepare_at(p, w, h, scale, ctx.doc, ctx.time, ctx.preview) else { continue };
         let prep = if ctx.magnified_image_pixels && matches!(p.kind, PaintKind::Image(_)) { pixels_when_magnified(prep, scale) } else { prep };
         let paint = tiny_skia::Paint { shader: prep.shader(), anti_alias: true, blend_mode: ts_blend(p.blend), ..Default::default() };
         if p.blend == BlendMode::PlusDarker {
@@ -480,9 +483,13 @@ pub fn effect_margin(n: &Node) -> f64 {
             EffectKind::BackgroundBlur { .. } | EffectKind::Glass(_) => e.backdrop_radius() * 2.0,
             EffectKind::DropShadow(s) => s.radius * 2.0 + s.spread.abs() * figcraft_doc::SPREAD_MITER_LIMIT + s.offset.0.abs() + s.offset.1.abs(),
             EffectKind::Texture(t) => t.radius.abs(),
-            // A group's inner shadows are cast from around its pixels: a layer cut off at the
-            // view would cast one from the cut.
-            EffectKind::InnerShadow(s) if matches!(n.kind, NodeKind::Group) => s.radius * 2.0 + s.spread.abs() + s.offset.0.abs() + s.offset.1.abs(),
+            // Inner shadows cast from around a layer's pixels (groups, image fills with alpha; any
+            // image counts here): a layer cut off at the view would cast one from the cut.
+            EffectKind::InnerShadow(s)
+                if matches!(n.kind, NodeKind::Group) || n.fills.iter().any(|f| matches!(f.kind, PaintKind::Image(_) | PaintKind::Pattern(_))) =>
+            {
+                s.radius * 2.0 + s.spread.abs() + s.offset.0.abs() + s.offset.1.abs()
+            }
             _ => 0.0,
         })
         .filter(|m| m.is_finite())
@@ -607,12 +614,16 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
     }
     let op = n.opacity.clamp(0.0, 1.0);
     {
-        // Inner shadows paint over the fills, under the children and strokes.
+        // Inner shadows paint over the fills, under the children and strokes: cast from around the
+        // outline, or around the fills' pixels where images paint their own alpha.
         let inner = |l: &mut Pixmap| {
+            let fills = shadow::inner_from_pixels(ctx.doc, n).then(|| l.clone());
             for e in n.effects.iter().filter(|e| e.visible) {
                 if let EffectKind::InnerShadow(s) = &e.kind
-                    && let Some(sh) = &shape
-                    && let Some(inner) = shadow::inner_shadow(sh, lw, lh, lxf, ctx.scale, s)
+                    && let Some(inner) = match &fills {
+                        Some(f) => shadow::inner_shadow_of(f, ctx.scale, s),
+                        None => shape.as_ref().and_then(|sh| shadow::inner_shadow(sh, lw, lh, lxf, ctx.scale, s)),
+                    }
                 {
                     l.draw_pixmap(0, 0, inner.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
                 }
