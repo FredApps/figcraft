@@ -6,12 +6,20 @@
 //! where it faces `light_angle`, half as bright on the opposite side, spread wider by `splay`.
 //! `frost` blurs the backdrop first. Distances to the outline come from an exact Euclidean
 //! distance transform of the shape's coverage.
+//!
+//! The shape's coverage, distances and normals depend only on the shape and the zoom. Once a
+//! later render asks for the same shape at the same zoom they are worked out for the whole shape,
+//! in its own pixel frame, and kept in a cache of at most [`MAX_CACHED_BYTES`]: moving or editing
+//! what lies under the glass, dragging its sliders, panning and patching the canvas reuse them.
+//! Zooming doesn't (each zoom is new).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use figcraft_doc::Glass;
 use figcraft_geom::Affine;
+use figcraft_geom::kurbo::Shape as _;
 use tiny_skia::Pixmap;
 
 use crate::fx;
@@ -266,9 +274,212 @@ fn light_reach(band: f64, intensity: f64) -> f64 {
 /// zoom would otherwise need a huge margin of coverage around every cut).
 const MAX_LIGHT_PX: f64 = 512.0;
 
-/// Geometry depends on the shape and its rasterisation, never on the backdrop, frost or light
-/// direction. Keep a small shared LRU so dragging a pane or its light reuses the distance field
-/// across canvas renders and parallel bands. Exact keys preserve subpixel coverage.
+/// A shape's coverage (alpha), distance to its edge and smoothed inward normals over a window of
+/// pixels whose top-left pixel is (`x0`, `y0`).
+struct Fields {
+    x0: i64,
+    y0: i64,
+    w: usize,
+    h: usize,
+    cov: Vec<u8>,
+    dist: Vec<f32>,
+    normals: Vec<(f32, f32)>,
+}
+
+/// Bytes a field pixel holds: coverage, distance and a normal.
+const FIELD_PX_BYTES: u64 = 1 + 4 + 8;
+
+impl Fields {
+    /// The fields of `cov`, the shape's coverage on the window at (`x0`, `y0`), normals smoothed
+    /// over `r` pixels.
+    fn new(cov: &Pixmap, x0: i64, y0: i64, r: usize) -> Fields {
+        FIELDS_COMPUTED.with(|n| n.set(n.get() + 1));
+        let dist = inside_distance(cov);
+        let (w, h) = (cov.width() as usize, cov.height() as usize);
+        let normals = smooth_normals(&dist, w, h, r);
+        let cov = cov.data().chunks_exact(4).map(|p| p.get(3).copied().unwrap_or(0)).collect();
+        Fields { x0, y0, w, h, cov, dist, normals }
+    }
+
+    /// Coverage (0–1), distance and inward normal at pixel (`x`, `y`); `None` outside the window.
+    fn at(&self, x: i64, y: i64) -> Option<(f32, f32, (f32, f32))> {
+        let (fx, fy) = (x.checked_sub(self.x0)?, y.checked_sub(self.y0)?);
+        if fx < 0 || fy < 0 || fx >= self.w as i64 || fy >= self.h as i64 {
+            return None;
+        }
+        let i = fy as usize * self.w + fx as usize;
+        Some((f32::from(*self.cov.get(i)?) / 255.0, *self.dist.get(i)?, *self.normals.get(i)?))
+    }
+}
+
+thread_local! {
+    static FIELDS_COMPUTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has worked out a glass shape's fields: what a cache miss costs. For
+/// tests and benchmarks.
+pub fn glass_fields_computed() -> u64 {
+    FIELDS_COMPUTED.with(std::cell::Cell::get)
+}
+
+/// What a glass shape's fields depend on, with the transform's translation reduced to its fraction
+/// of a pixel: the same shape at the same zoom has the same key wherever it is and however a render
+/// cuts it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShapeKey {
+    path: u64,
+    linear: [u64; 4],
+    frac: (i64, i64),
+    margin: u32,
+    r: usize,
+}
+
+/// The cached fields of a shape whose window holds at most this many pixels; bigger shapes (a
+/// pane far larger than the view) are worked out for the part a render shows each time.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SHAPE_PX: u64 = 4 << 20;
+#[cfg(target_arch = "wasm32")]
+const MAX_SHAPE_PX: u64 = 1 << 20;
+/// Bytes the glass shape cache holds at most (less on the web, where memory never shrinks).
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_CACHED_BYTES: u64 = 128 << 20;
+#[cfg(target_arch = "wasm32")]
+const MAX_CACHED_BYTES: u64 = 32 << 20;
+
+/// A shape's fields once worked out; parallel bands wanting the same shape wait for one of them.
+type Slot = Arc<OnceLock<Option<Arc<Fields>>>>;
+
+/// The shapes' fields by key, at most `budget` bytes; the least recently used go first. A shape is
+/// kept from the second render that asks for it: one asked for once (each step of a zoom, a pane
+/// dragged by fractions of a pixel) is cheaper worked out for just the part a render shows.
+struct ShapeCache {
+    map: HashMap<ShapeKey, (Slot, u64, u64)>,
+    /// Shapes asked for but not kept, by the render that first asked.
+    seen: HashMap<ShapeKey, u64>,
+    held: u64,
+    tick: u64,
+    budget: u64,
+}
+
+/// Shapes remembered as asked for once; past this many they are forgotten.
+const MAX_SEEN: usize = 256;
+
+impl ShapeCache {
+    fn new(budget: u64) -> Self {
+        Self { map: HashMap::new(), seen: HashMap::new(), held: 0, tick: 0, budget }
+    }
+
+    /// The slot for `key` (filled or about to be) asked for in render number `render`, making room
+    /// for `bytes`; `None` when it isn't kept (first asked for in this render, or too big).
+    fn slot(&mut self, key: &ShapeKey, bytes: u64, render: u64) -> Option<Slot> {
+        self.tick += 1;
+        if let Some((slot, _, used)) = self.map.get_mut(key) {
+            *used = self.tick;
+            return Some(slot.clone());
+        }
+        if bytes > self.budget {
+            return None;
+        }
+        match self.seen.get(key) {
+            Some(first) if *first < render => {
+                self.seen.remove(key);
+            }
+            Some(_) => return None,
+            None => {
+                if self.seen.len() >= MAX_SEEN {
+                    self.seen.clear();
+                }
+                self.seen.insert(key.clone(), render);
+                return None;
+            }
+        }
+        while self.held + bytes > self.budget {
+            let oldest = self.map.iter().min_by_key(|(_, (_, _, used))| *used).map(|(k, _)| k.clone())?;
+            if let Some((_, b, _)) = self.map.remove(&oldest) {
+                self.held -= b;
+            }
+        }
+        let slot = Slot::default();
+        self.map.insert(key.clone(), (slot.clone(), bytes, self.tick));
+        self.held += bytes;
+        Some(slot)
+    }
+}
+
+fn shape_cache() -> &'static Mutex<ShapeCache> {
+    static C: OnceLock<Mutex<ShapeCache>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(ShapeCache::new(MAX_CACHED_BYTES)))
+}
+
+/// The fields `glass` reads for a `w` × `h` layer whose `shape` maps through `xf` (local → layer
+/// pixels), exact for distances up to the margin `m`, normals smoothed over `r` pixels, and the
+/// shift from layer pixels to the fields' pixels.
+///
+/// A shape asked for again in a later render, whose window fits [`MAX_SHAPE_PX`], is worked out
+/// whole, in its own frame (the translation's fraction of a pixel), and kept: a band, a canvas
+/// patch or the next frame of a drag reads the same fields. Otherwise it is worked out for the part
+/// shown plus the margin.
+fn shape_fields(shape: &Outline, xf: Affine, w: u32, h: u32, m: u32, r: usize) -> Option<(Arc<Fields>, (i64, i64))> {
+    if let Some(whole) = whole_shape(shape, xf, m, r) {
+        return Some(whole);
+    }
+    let cov = spread_alpha(std::slice::from_ref(shape), 0.0, Affine::translate((f64::from(m), f64::from(m))) * xf, w + 2 * m, h + 2 * m)?;
+    Some((Arc::new(Fields::new(&cov, -i64::from(m), -i64::from(m), r)), (0, 0)))
+}
+
+/// [`shape_fields`] for a whole shape, from the cache; `None` when it isn't kept (first asked for
+/// in this render, too big, or its transform too far out).
+fn whole_shape(shape: &Outline, xf: Affine, m: u32, r: usize) -> Option<(Arc<Fields>, (i64, i64))> {
+    let [a, b, c, d, e, f] = xf.as_coeffs();
+    // The translation in steps of 1/65536 px (far finer than the rasteriser's 1/64, coarse enough
+    // that rounding errors in where a render starts land on the same step), its whole pixels (the
+    // shift) and the fraction left; rounding first carries 99.9999999 over to 100.
+    const STEPS: f64 = 65536.0;
+    let q = |v: f64| {
+        let q = (v * STEPS).round();
+        (q.is_finite() && q.abs() < 1e15).then_some(q as i64)
+    };
+    let (qe, qf) = (q(e)?, q(f)?);
+    let shift = (qe.div_euclid(STEPS as i64), qf.div_euclid(STEPS as i64));
+    let frac = (qe.rem_euclid(STEPS as i64), qf.rem_euclid(STEPS as i64));
+    let own = Affine::new([a, b, c, d, frac.0 as f64 / STEPS, frac.1 as f64 / STEPS]);
+    let bb = (own * shape.0.clone()).bounding_box();
+    let (x0, y0, x1, y1) = (bb.x0.floor(), bb.y0.floor(), bb.x1.ceil(), bb.y1.ceil());
+    if ![x0, y0, x1, y1].iter().all(|v| v.is_finite() && v.abs() < 1e9) {
+        return None;
+    }
+    // The margin in steps of 32 px, so dragging a slider that widens it a little keeps the same
+    // fields (a wider margin only adds exact distances further out: the same pixels).
+    let margin = m.div_ceil(32).checked_mul(32)?;
+    let (rw, rh) = ((x1 - x0) as u64 + 2, (y1 - y0) as u64 + 2);
+    let (ww, wh) = (rw + 2 * u64::from(margin), rh + 2 * u64::from(margin));
+    if ww.checked_mul(wh)? > MAX_SHAPE_PX {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    crate::draw::hash_path(&shape.0, &mut hasher);
+    matches!(shape.1, tiny_skia::FillRule::EvenOdd).hash(&mut hasher);
+    let key = ShapeKey { path: hasher.finish(), linear: [a, b, c, d].map(f64::to_bits), frac, margin, r };
+    let compute = || {
+        // Rastered against the shape's own bounds (not the window), so the margin can't move a
+        // coverage value.
+        let raster = spread_alpha(std::slice::from_ref(shape), 0.0, Affine::translate((1.0 - x0, 1.0 - y0)) * own, rw as u32, rh as u32)?;
+        let mut win = Pixmap::new(ww as u32, wh as u32)?;
+        let (row, at) = (raster.width() as usize * 4, (margin as usize, margin as usize));
+        let stride = win.width() as usize * 4;
+        for (y, src) in raster.data().chunks_exact(row).enumerate() {
+            let start = (y + at.1) * stride + at.0 * 4;
+            win.data_mut().get_mut(start..start + row)?.copy_from_slice(src);
+        }
+        let origin = (x0 as i64 - 1 - i64::from(margin), y0 as i64 - 1 - i64::from(margin));
+        Some(Fields::new(&win, origin.0, origin.1, r))
+    };
+    let slot =
+        shape_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).slot(&key, ww * wh * FIELD_PX_BYTES, crate::render_number())?;
+    Some((slot.get_or_init(|| compute().map(Arc::new)).clone()?, shift))
+}
+
+#[cfg(test)]
 #[derive(Clone, PartialEq)]
 struct GeometryKey {
     shape: Outline,
@@ -279,12 +490,14 @@ struct GeometryKey {
     smooth: usize,
 }
 
+#[cfg(test)]
 struct Geometry {
     coverage: Vec<u8>,
     distance: Vec<f32>,
     normals: Vec<(f32, f32)>,
 }
 
+#[cfg(test)]
 impl Geometry {
     fn bytes(&self) -> usize {
         self.coverage
@@ -294,15 +507,19 @@ impl Geometry {
     }
 }
 
+#[cfg(test)]
 const MAX_GEOMETRY_BYTES: usize = 64 << 20;
+#[cfg(test)]
 const MAX_GEOMETRIES: usize = 16;
 
+#[cfg(test)]
 #[derive(Default)]
 struct GeometryCache {
     entries: VecDeque<(GeometryKey, Arc<Geometry>, usize)>,
     bytes: usize,
 }
 
+#[cfg(test)]
 impl GeometryCache {
     fn get(&mut self, key: &GeometryKey) -> Option<Arc<Geometry>> {
         let index = self.entries.iter().position(|(k, _, _)| k == key)?;
@@ -320,8 +537,6 @@ impl GeometryCache {
         if bytes > budget {
             return;
         }
-        // Another band may have finished computing the same geometry while we were outside the
-        // lock. Keep its entry rather than charging the same key twice.
         if self.get(&key).is_some() {
             return;
         }
@@ -334,11 +549,13 @@ impl GeometryCache {
     }
 }
 
+#[cfg(test)]
 fn geometry_cache() -> &'static Mutex<GeometryCache> {
     static CACHE: OnceLock<Mutex<GeometryCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(GeometryCache::default()))
 }
 
+#[cfg(test)]
 fn geometry(key: GeometryKey) -> Option<Arc<Geometry>> {
     if let Some(hit) = geometry_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
         return Some(hit);
@@ -349,7 +566,6 @@ fn geometry(key: GeometryKey) -> Option<Arc<Geometry>> {
     let cov = spread_alpha(std::slice::from_ref(&key.shape), 0.0, Affine::translate((f64::from(m), f64::from(m))) * key.xf, cw, ch)?;
     let dist = inside_distance(&cov);
     let normals = smooth_normals(&dist, cw as usize, ch as usize, key.smooth);
-    // The margin is scratch space only. Retain precisely the samples the pane reads.
     let count = (key.w as usize).checked_mul(key.h as usize)?;
     let mut out = Geometry { coverage: Vec::with_capacity(count), distance: Vec::with_capacity(count), normals: Vec::with_capacity(count) };
     for y in m..m.checked_add(key.h)? {
@@ -377,7 +593,7 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
     // exact: the bend's (within `depth`), the light's (within `reach`) and those the normals are
     // smoothed from (2r + 1 further).
     let m = depth.max(reach).ceil() as u32 + 4 * r as u32 + 4;
-    let geometry = geometry(GeometryKey { shape: shape.clone(), xf, w, h, margin: m, smooth: r })?;
+    let (fields, shift) = shape_fields(shape, xf, w, h, m, r)?;
     // No frost means sampling the existing backdrop directly; no clone or blur buffers.
     let frosted = (g.frost / 2.0 * scale > 0.3).then(|| {
         let mut p = back.clone();
@@ -407,33 +623,27 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
     let fh = frosted.height() as usize;
     let (w, h) = (w as usize, h as usize);
     let pad = pad as usize;
-    let cov = &geometry.coverage;
-    let distance = &geometry.distance;
     for y in 0..h {
         for x in 0..w {
-            let index = y * w + x;
-            let c_byte = cov.get(index).copied().unwrap_or(0);
-            if c_byte == 0 {
+            let Some((c, d, inward)) = fields.at(x as i64 - shift.0, y as i64 - shift.1) else { continue };
+            if c <= 0.0 {
                 continue;
             }
-            let d = distance.get(index).copied().unwrap_or(0.0);
-            if c_byte == 255 && d >= flat_d {
+            if c >= 1.0 && d >= flat_d {
                 let fx = x + pad;
                 let fy = y + pad;
                 if fx < fw && fy < fh {
                     let src_idx = (fy * fw + fx) * 4;
-                    let dst_idx = index * 4;
+                    let dst_idx = (y * w + x) * 4;
                     if let (Some(src_bytes), Some(dst_bytes)) = (frosted_data.get(src_idx..src_idx + 4), dst.get_mut(dst_idx..dst_idx + 4)) {
                         dst_bytes.copy_from_slice(src_bytes);
                         continue;
                     }
                 }
             }
-            let c = f32::from(c_byte) / 255.0;
             let t = (d / depth).min(1.0);
             let bend = bend_max * (1.0 - t) * (1.0 - t);
-            let need_normals = bend != 0.0 || (has_light && d <= reach);
-            let (nx, ny) = if need_normals { geometry.normals.get(index).copied().unwrap_or((0.0, 0.0)) } else { (0.0, 0.0) };
+            let (nx, ny) = inward;
             let (bx, by) = (x as f32 + pad as f32 + 0.5, y as f32 + pad as f32 + 0.5);
             let base = if bend == 0.0 {
                 // Nothing bends (past `depth`, or no refraction): the three channels' samples are
@@ -466,7 +676,7 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
             } else {
                 0.0
             };
-            let dst_idx = index * 4;
+            let dst_idx = (y * w + x) * 4;
             if let Some(p) = dst.get_mut(dst_idx..dst_idx + 4) {
                 for (o, v) in p.iter_mut().zip(base) {
                     *o = ((v * (1.0 - hl) + 255.0 * hl) * c).round().clamp(0.0, 255.0) as u8;
@@ -497,6 +707,28 @@ mod tests {
         assert!((d[10 * 21 + 10] - 5.5).abs() < 1e-4, "{}", d[10 * 21 + 10]);
         // A pixel on the edge is half a pixel from it.
         assert!((d[10 * 21 + 5] - 0.5).abs() < 1e-4, "{}", d[10 * 21 + 5]);
+    }
+
+    #[test]
+    fn the_shape_cache_stays_within_its_bytes() {
+        let key = |i: u64| ShapeKey { path: i, linear: [0; 4], frac: (0, 0), margin: 0, r: 1 };
+        let mut c = ShapeCache::new(100);
+        // Kept from the second render that asks, not the first (nor again within the first).
+        assert!(c.slot(&key(1), 40, 1).is_none());
+        assert!(c.slot(&key(1), 40, 1).is_none());
+        assert!(c.slot(&key(1), 40, 2).is_some());
+        for k in [2, 3] {
+            assert!(c.slot(&key(k), 40, 2).is_none());
+        }
+        assert!(c.slot(&key(2), 40, 3).is_some());
+        // Using 1 again makes 2 the least recently used: 2 goes to make room for 3.
+        assert!(c.slot(&key(1), 40, 3).is_some());
+        assert!(c.slot(&key(3), 40, 3).is_some());
+        assert!(c.held <= 100, "{}", c.held);
+        assert!(c.map.contains_key(&key(1)) && c.map.contains_key(&key(3)) && !c.map.contains_key(&key(2)));
+        // More than it holds in all: never kept.
+        assert!(c.slot(&key(4), 101, 3).is_none() && c.slot(&key(4), 101, 4).is_none());
+        assert!(c.held <= 100 && !c.map.contains_key(&key(4)));
     }
 
     #[test]
