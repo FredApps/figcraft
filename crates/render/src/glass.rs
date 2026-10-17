@@ -13,7 +13,7 @@
 //! what lies under the glass, dragging its sliders, panning and patching the canvas reuse them.
 //! Zooming doesn't (each zoom is new).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -515,7 +515,7 @@ const MAX_GEOMETRIES: usize = 16;
 #[cfg(test)]
 #[derive(Default)]
 struct GeometryCache {
-    entries: VecDeque<(GeometryKey, Arc<Geometry>, usize)>,
+    entries: std::collections::VecDeque<(GeometryKey, Arc<Geometry>, usize)>,
     bytes: usize,
 }
 

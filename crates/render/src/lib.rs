@@ -125,6 +125,9 @@ pub(crate) fn rendered_nodes<'a>(doc: &'a Document, page: NodeId, opts: &Options
 
 /// The largest backdrop radius that can participate in a page render (0 without any).
 pub(crate) fn max_backdrop_blur(doc: &Document, page: NodeId, opts: &Options) -> f64 {
+    if doc.max_backdrop_radius() == 0.0 {
+        return 0.0;
+    }
     rendered_nodes(doc, page, opts).iter().flat_map(|n| n.effects.iter()).map(figcraft_doc::Effect::backdrop_radius).fold(0.0, f64::max)
 }
 
@@ -226,6 +229,7 @@ fn render_one(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Opti
         pix.fill(paint::ts_color(bg));
     }
     let lod = opts.lod && !opts.outline_mode && view.scale <= lod::MAX_SCALE;
+    let bounds = draw::Bounds::default();
     let ctx = draw::Ctx {
         doc,
         scale: view.scale,
@@ -236,6 +240,7 @@ fn render_one(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Opti
         lod,
         under: None,
         time: 0.0,
+        bounds: &bounds,
     };
     let xf = view.transform();
     let Some(p) = doc.node(page) else { return Some(pix) };
@@ -257,6 +262,7 @@ pub fn render_nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut 
 
 /// [`render_nodes_into`] `time` seconds into animated GIFs.
 fn nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap, time: f64) {
+    let bounds = draw::Bounds::default();
     let ctx = draw::Ctx {
         doc,
         scale: view.scale,
@@ -267,6 +273,7 @@ fn nodes_into(doc: &Document, ids: &[NodeId], view: &View, pix: &mut Pixmap, tim
         lod: false,
         under: None,
         time,
+        bounds: &bounds,
     };
     for id in ids {
         draw::draw_node(&ctx, pix, *id, view.transform() * parent_transform(doc, *id), 0);
@@ -489,6 +496,8 @@ mod backdrop_tests;
 mod band_tests;
 #[cfg(test)]
 mod boolean_cache_tests;
+#[cfg(test)]
+mod bounds_memo_tests;
 #[cfg(test)]
 mod effect_composition_tests;
 #[cfg(test)]

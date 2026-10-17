@@ -71,7 +71,11 @@ struct Sensitive {
 fn sensitive(doc: &Document, page: NodeId, opts: &Options) -> Sensitive {
     let nodes = crate::rendered_nodes(doc, page, opts);
     let noisy = nodes.iter().filter(|n| n.effects.iter().any(|e| e.visible && matches!(e.kind, EffectKind::Noise(_) | EffectKind::Texture(_))));
-    let backdrop_blur = nodes.iter().flat_map(|n| n.effects.iter()).map(figcraft_doc::Effect::backdrop_radius).fold(0.0, f64::max);
+    let backdrop_blur = if doc.max_backdrop_radius() == 0.0 {
+        0.0
+    } else {
+        nodes.iter().flat_map(|n| n.effects.iter()).map(figcraft_doc::Effect::backdrop_radius).fold(0.0, f64::max)
+    };
     let areas = noisy.filter_map(|n| draw::paint_bounds(doc, n.id)).collect();
     let mut pattern_sources = Vec::new();
     let mut pending = pattern_refs(nodes.iter().copied());
