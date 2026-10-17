@@ -46,7 +46,7 @@ fn wide_light() -> Glass {
 fn cut_diffs(d: &Document, p: NodeId) -> Vec<(u32, (u8, usize))> {
     let opts = Options::default();
     let full = render_view_single(d, p, &View { origin: (0.0, 0.0), scale: 2.0, width: 2400, height: 1600 }, &opts).unwrap();
-    let margin = crate::backdrop_reach(crate::max_backdrop_blur(d), 2.0).ceil() as u32 + 1;
+    let margin = crate::backdrop_reach(crate::max_backdrop_blur(d, p, &opts), 2.0).ceil() as u32 + 1;
     [490u32, 505, 520]
         .into_iter()
         .map(|cut| {

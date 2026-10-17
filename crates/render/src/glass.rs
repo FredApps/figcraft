@@ -7,6 +7,9 @@
 //! `frost` blurs the backdrop first. Distances to the outline come from an exact Euclidean
 //! distance transform of the shape's coverage.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use figcraft_doc::Glass;
 use figcraft_geom::Affine;
 use tiny_skia::Pixmap;
@@ -61,6 +64,26 @@ fn edt_1d(f: &[f64], d: &mut [f64], v: &mut [usize], z: &mut [f64]) {
     }
 }
 
+/// Cache-blocked 32×32 transpose of a `w` × `h` f64 buffer into a `h` × `w` buffer.
+fn transpose_f64(src: &[f64], dst: &mut [f64], w: usize, h: usize) {
+    const TILE: usize = 32;
+    for ty in (0..h).step_by(TILE) {
+        let y_max = (ty + TILE).min(h);
+        for tx in (0..w).step_by(TILE) {
+            let x_max = (tx + TILE).min(w);
+            for y in ty..y_max {
+                for x in tx..x_max {
+                    let s = y * w + x;
+                    let d = x * h + y;
+                    if let (Some(sp), Some(dp)) = (src.get(s), dst.get_mut(d)) {
+                        *dp = *sp;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// For a `w` × `h` coverage pixmap: each pixel's distance (pixels) from its centre to the edge of
 /// the shape (pixels at least half covered), 0 outside.
 pub fn inside_distance(cov: &Pixmap) -> Vec<f32> {
@@ -69,19 +92,16 @@ pub fn inside_distance(cov: &Pixmap) -> Vec<f32> {
     let mut g: Vec<f64> = cov.data().chunks_exact(4).map(|p| if p.get(3).copied().unwrap_or(0) >= 128 { FAR } else { 0.0 }).collect();
     let n = w.max(h);
     let (mut f, mut d, mut v, mut z) = (vec![0f64; n], vec![0f64; n], vec![0usize; n], vec![0f64; n + 1]);
+    let mut gt = vec![0f64; w * h];
+    transpose_f64(&g, &mut gt, w, h);
     for x in 0..w {
-        for y in 0..h {
-            if let (Some(fy), Some(gv)) = (f.get_mut(y), g.get(y * w + x)) {
-                *fy = *gv;
-            }
-        }
-        edt_1d(f.get(..h).unwrap_or(&[]), d.get_mut(..h).unwrap_or(&mut []), &mut v, &mut z);
-        for y in 0..h {
-            if let (Some(gv), Some(dy)) = (g.get_mut(y * w + x), d.get(y)) {
-                *gv = *dy;
-            }
+        let col = x * h;
+        if let (Some(col_slice), Some(out)) = (gt.get_mut(col..col + h), d.get_mut(..h)) {
+            edt_1d(col_slice, out, &mut v, &mut z);
+            col_slice.copy_from_slice(out);
         }
     }
+    transpose_f64(&gt, &mut g, h, w);
     for y in 0..h {
         let row = y * w;
         if let (Some(src), Some(dst)) = (g.get(row..row + w), f.get_mut(..w)) {
@@ -99,21 +119,58 @@ pub fn inside_distance(cov: &Pixmap) -> Vec<f32> {
 /// Running-sum box blur of a `w` × `h` field along rows (`stride` 1) or columns (`stride` `w`),
 /// radius `r`, zero outside.
 fn box_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, rows: bool) {
-    let (lines, len, step, across) = if rows { (h, w, 1, w) } else { (w, h, w, 1) };
+    if w == 0 || h == 0 {
+        return;
+    }
     let norm = 1.0 / (2 * r + 1) as f32;
-    for l in 0..lines {
-        let base = l * across;
-        let at = |i: usize| src.get(base + i * step).copied().unwrap_or(0.0);
-        let mut acc: f32 = (0..=r.min(len.saturating_sub(1))).map(at).sum();
-        for i in 0..len {
-            if let Some(o) = dst.get_mut(base + i * step) {
-                *o = acc * norm;
+    if rows {
+        let (lines, len, step, across) = (h, w, 1, w);
+        for l in 0..lines {
+            let base = l * across;
+            let at = |i: usize| src.get(base + i * step).copied().unwrap_or(0.0);
+            let mut acc: f32 = (0..=r.min(len.saturating_sub(1))).map(at).sum();
+            for i in 0..len {
+                if let Some(o) = dst.get_mut(base + i * step) {
+                    *o = acc * norm;
+                }
+                if i + r + 1 < len {
+                    acc += at(i + r + 1);
+                }
+                if i >= r {
+                    acc -= at(i - r);
+                }
             }
-            if i + r + 1 < len {
-                acc += at(i + r + 1);
+        }
+    } else {
+        const STRIP: usize = 32;
+        for x0 in (0..w).step_by(STRIP) {
+            let strip_w = (w - x0).min(STRIP);
+            let mut acc = [0.0f32; STRIP];
+            for i in 0..=r.min(h.saturating_sub(1)) {
+                let row = i * w;
+                for k in 0..strip_w {
+                    acc[k] += src.get(row + x0 + k).copied().unwrap_or(0.0);
+                }
             }
-            if i >= r {
-                acc -= at(i - r);
+            for i in 0..h {
+                let row = i * w;
+                for k in 0..strip_w {
+                    if let Some(o) = dst.get_mut(row + x0 + k) {
+                        *o = acc[k] * norm;
+                    }
+                }
+                if i + r + 1 < h {
+                    let add_row = (i + r + 1) * w;
+                    for k in 0..strip_w {
+                        acc[k] += src.get(add_row + x0 + k).copied().unwrap_or(0.0);
+                    }
+                }
+                if i >= r {
+                    let sub_row = (i - r) * w;
+                    for k in 0..strip_w {
+                        acc[k] -= src.get(sub_row + x0 + k).copied().unwrap_or(0.0);
+                    }
+                }
             }
         }
     }
@@ -159,14 +216,35 @@ fn sample(p: &Pixmap, x: f32, y: f32) -> [f32; 4] {
     let (tx, ty) = (x - x0, y - y0);
     let (x0, y0) = (x0 as i64, y0 as i64);
     let data = p.data();
+    if x0 >= 0 && y0 >= 0 && x0 + 1 < w && y0 + 1 < h {
+        let stride = (w as usize).saturating_mul(4);
+        let r0_start = (y0 as usize).saturating_mul(stride);
+        let r1_start = ((y0 + 1) as usize).saturating_mul(stride);
+        let c0 = (x0 as usize).saturating_mul(4);
+        let c1 = c0 + 4;
+        if let (Some(row0), Some(row1)) = (data.get(r0_start..r0_start.saturating_add(stride)), data.get(r1_start..r1_start.saturating_add(stride)))
+            && let (Some(&[a0, a1, a2, a3]), Some(&[b0, b1, b2, b3]), Some(&[c0, c1, c2, c3]), Some(&[d0, d1, d2, d3])) =
+                (row0.get(c0..c0 + 4), row0.get(c1..c1 + 4), row1.get(c0..c0 + 4), row1.get(c1..c1 + 4))
+        {
+            let a = [f32::from(a0), f32::from(a1), f32::from(a2), f32::from(a3)];
+            let b = [f32::from(b0), f32::from(b1), f32::from(b2), f32::from(b3)];
+            let c = [f32::from(c0), f32::from(c1), f32::from(c2), f32::from(c3)];
+            let d = [f32::from(d0), f32::from(d1), f32::from(d2), f32::from(d3)];
+            return std::array::from_fn(|k| {
+                let top = a[k] + (b[k] - a[k]) * tx;
+                let bot = c[k] + (d[k] - c[k]) * tx;
+                top + (bot - top) * ty
+            });
+        }
+    }
     let px = |xi: i64, yi: i64| -> [f32; 4] {
         if xi < 0 || yi < 0 || xi >= w || yi >= h {
             return [0.0; 4];
         }
         let i = ((yi * w + xi) * 4) as usize;
         match data.get(i..i + 4) {
-            Some(s) => [f32::from(s[0]), f32::from(s[1]), f32::from(s[2]), f32::from(s[3])],
-            None => [0.0; 4],
+            Some(&[s0, s1, s2, s3]) => [f32::from(s0), f32::from(s1), f32::from(s2), f32::from(s3)],
+            _ => [0.0; 4],
         }
     };
     let (a, b, c, d) = (px(x0, y0), px(x0 + 1, y0), px(x0, y0 + 1), px(x0 + 1, y0 + 1));
@@ -188,6 +266,104 @@ fn light_reach(band: f64, intensity: f64) -> f64 {
 /// zoom would otherwise need a huge margin of coverage around every cut).
 const MAX_LIGHT_PX: f64 = 512.0;
 
+/// Geometry depends on the shape and its rasterisation, never on the backdrop, frost or light
+/// direction. Keep a small shared LRU so dragging a pane or its light reuses the distance field
+/// across canvas renders and parallel bands. Exact keys preserve subpixel coverage.
+#[derive(Clone, PartialEq)]
+struct GeometryKey {
+    shape: Outline,
+    xf: Affine,
+    w: u32,
+    h: u32,
+    margin: u32,
+    smooth: usize,
+}
+
+struct Geometry {
+    coverage: Vec<u8>,
+    distance: Vec<f32>,
+    normals: Vec<(f32, f32)>,
+}
+
+impl Geometry {
+    fn bytes(&self) -> usize {
+        self.coverage
+            .capacity()
+            .saturating_add(self.distance.capacity().saturating_mul(std::mem::size_of::<f32>()))
+            .saturating_add(self.normals.capacity().saturating_mul(std::mem::size_of::<(f32, f32)>()))
+    }
+}
+
+const MAX_GEOMETRY_BYTES: usize = 64 << 20;
+const MAX_GEOMETRIES: usize = 16;
+
+#[derive(Default)]
+struct GeometryCache {
+    entries: VecDeque<(GeometryKey, Arc<Geometry>, usize)>,
+    bytes: usize,
+}
+
+impl GeometryCache {
+    fn get(&mut self, key: &GeometryKey) -> Option<Arc<Geometry>> {
+        let index = self.entries.iter().position(|(k, _, _)| k == key)?;
+        let entry = self.entries.remove(index)?;
+        let out = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(out)
+    }
+
+    fn insert(&mut self, key: GeometryKey, geometry: Arc<Geometry>, budget: usize) {
+        let bytes = geometry
+            .bytes()
+            .saturating_add(key.shape.0.elements().len().saturating_mul(std::mem::size_of::<figcraft_geom::kurbo::PathEl>()))
+            .saturating_add(std::mem::size_of::<GeometryKey>() + std::mem::size_of::<Geometry>());
+        if bytes > budget {
+            return;
+        }
+        // Another band may have finished computing the same geometry while we were outside the
+        // lock. Keep its entry rather than charging the same key twice.
+        if self.get(&key).is_some() {
+            return;
+        }
+        while self.entries.len() >= MAX_GEOMETRIES || self.bytes.saturating_add(bytes) > budget {
+            let Some((_, _, old)) = self.entries.pop_front() else { break };
+            self.bytes = self.bytes.saturating_sub(old);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.push_back((key, geometry, bytes));
+    }
+}
+
+fn geometry_cache() -> &'static Mutex<GeometryCache> {
+    static CACHE: OnceLock<Mutex<GeometryCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(GeometryCache::default()))
+}
+
+fn geometry(key: GeometryKey) -> Option<Arc<Geometry>> {
+    if let Some(hit) = geometry_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
+        return Some(hit);
+    }
+    let m = key.margin;
+    let cw = key.w.checked_add(m.checked_mul(2)?)?;
+    let ch = key.h.checked_add(m.checked_mul(2)?)?;
+    let cov = spread_alpha(std::slice::from_ref(&key.shape), 0.0, Affine::translate((f64::from(m), f64::from(m))) * key.xf, cw, ch)?;
+    let dist = inside_distance(&cov);
+    let normals = smooth_normals(&dist, cw as usize, ch as usize, key.smooth);
+    // The margin is scratch space only. Retain precisely the samples the pane reads.
+    let count = (key.w as usize).checked_mul(key.h as usize)?;
+    let mut out = Geometry { coverage: Vec::with_capacity(count), distance: Vec::with_capacity(count), normals: Vec::with_capacity(count) };
+    for y in m..m.checked_add(key.h)? {
+        let start = (y as usize).checked_mul(cw as usize)?.checked_add(m as usize)?;
+        let end = start.checked_add(key.w as usize)?;
+        out.coverage.extend(cov.data().get(start.checked_mul(4)?..end.checked_mul(4)?)?.chunks_exact(4).map(|p| p[3]));
+        out.distance.extend_from_slice(dist.get(start..end)?);
+        out.normals.extend_from_slice(normals.get(start..end)?);
+    }
+    let out = Arc::new(out);
+    geometry_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, out.clone(), MAX_GEOMETRY_BYTES);
+    Some(out)
+}
+
 /// The glass of a `w` × `h` layer whose `shape` maps through `xf` (local → layer pixels), from
 /// `back`, its backdrop padded by `pad` pixels each way, at `scale` device pixels per unit.
 #[allow(clippy::too_many_arguments)]
@@ -201,14 +377,17 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
     // exact: the bend's (within `depth`), the light's (within `reach`) and those the normals are
     // smoothed from (2r + 1 further).
     let m = depth.max(reach).ceil() as u32 + 4 * r as u32 + 4;
-    let cov = spread_alpha(std::slice::from_ref(shape), 0.0, Affine::translate((f64::from(m), f64::from(m))) * xf, w + 2 * m, h + 2 * m)?;
-    let dist = inside_distance(&cov);
-    let (cw, ch) = (cov.width() as usize, cov.height() as usize);
-    let normals = smooth_normals(&dist, cw, ch, r);
-    let mut frosted = back.clone();
-    fx::blur(&mut frosted, g.frost / 2.0 * scale);
+    let geometry = geometry(GeometryKey { shape: shape.clone(), xf, w, h, margin: m, smooth: r })?;
+    // No frost means sampling the existing backdrop directly; no clone or blur buffers.
+    let frosted = (g.frost / 2.0 * scale > 0.3).then(|| {
+        let mut p = back.clone();
+        fx::blur(&mut p, g.frost / 2.0 * scale);
+        p
+    });
+    let frosted = frosted.as_ref().unwrap_or(back);
     let ang = g.light_angle.to_radians();
     let light = (ang.sin() as f32, -ang.cos() as f32);
+    let (lx, ly) = (-light.0, -light.1);
     let bend_max = (g.refraction * depth) as f32;
     let fringe = (g.dispersion * 0.25) as f32;
     let power = (6.0 - 5.0 * g.splay) as f32;
@@ -217,46 +396,78 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
     // fades out to 0 at `reach` instead of stopping there.
     let floor = (-reach / band).exp();
     let fall = 1.0 - floor;
+    let has_light = band > 0.0 && fall > 0.0;
     let intensity = g.light_intensity as f32;
     let depth = depth as f32;
+    let flat_d = if band > 0.0 { depth.max(reach) } else { depth };
     let mut out = Pixmap::new(w, h)?;
     let dst = out.data_mut();
-    let cd = cov.data();
-    let d_at = |x: usize, y: usize| dist.get(y * cw + x).copied().unwrap_or(0.0);
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let (mx, my) = (x + m as usize, y + m as usize);
-            let c = f32::from(cd.get((my * cw + mx) * 4 + 3).copied().unwrap_or(0)) / 255.0;
-            if c <= 0.0 {
+    let frosted_data = frosted.data();
+    let fw = frosted.width() as usize;
+    let fh = frosted.height() as usize;
+    let (w, h) = (w as usize, h as usize);
+    let pad = pad as usize;
+    let cov = &geometry.coverage;
+    let distance = &geometry.distance;
+    for y in 0..h {
+        for x in 0..w {
+            let index = y * w + x;
+            let c_byte = cov.get(index).copied().unwrap_or(0);
+            if c_byte == 0 {
                 continue;
             }
-            let d = d_at(mx, my);
-            let inward = normals.get(my * cw + mx).copied().unwrap_or((0.0, 0.0));
+            let d = distance.get(index).copied().unwrap_or(0.0);
+            if c_byte == 255 && d >= flat_d {
+                let fx = x + pad;
+                let fy = y + pad;
+                if fx < fw && fy < fh {
+                    let src_idx = (fy * fw + fx) * 4;
+                    let dst_idx = index * 4;
+                    if let (Some(src_bytes), Some(dst_bytes)) = (frosted_data.get(src_idx..src_idx + 4), dst.get_mut(dst_idx..dst_idx + 4)) {
+                        dst_bytes.copy_from_slice(src_bytes);
+                        continue;
+                    }
+                }
+            }
+            let c = f32::from(c_byte) / 255.0;
             let t = (d / depth).min(1.0);
             let bend = bend_max * (1.0 - t) * (1.0 - t);
+            let need_normals = bend != 0.0 || (has_light && d <= reach);
+            let (nx, ny) = if need_normals { geometry.normals.get(index).copied().unwrap_or((0.0, 0.0)) } else { (0.0, 0.0) };
             let (bx, by) = (x as f32 + pad as f32 + 0.5, y as f32 + pad as f32 + 0.5);
             let base = if bend == 0.0 {
                 // Nothing bends (past `depth`, or no refraction): the three channels' samples are
                 // at the same point, so one sample.
-                let s = sample(&frosted, bx, by);
+                let s = sample(frosted, bx, by);
                 [s[0].min(s[3]), s[1].min(s[3]), s[2].min(s[3]), s[3]]
             } else {
-                let at = |k: f32| sample(&frosted, bx + inward.0 * bend * k, by + inward.1 * bend * k);
-                let (rs, gs, bs) = (at(1.0 - fringe), at(1.0), at(1.0 + fringe));
-                let a = rs[3].max(gs[3]).max(bs[3]);
-                [rs[0].min(a), gs[1].min(a), bs[2].min(a), a]
+                let at = |k: f32| sample(frosted, bx + nx * bend * k, by + ny * bend * k);
+                if fringe == 0.0 {
+                    let s0 = at(1.0);
+                    [s0[0].min(s0[3]), s0[1].min(s0[3]), s0[2].min(s0[3]), s0[3]]
+                } else {
+                    let (rs, gs, bs) = (at(1.0 - fringe), at(1.0), at(1.0 + fringe));
+                    let a = rs[3].max(gs[3]).max(bs[3]);
+                    [rs[0].min(a), gs[1].min(a), bs[2].min(a), a]
+                }
             };
             // The rim catches the light where it faces it, and half as much opposite. It fades out
             // by `reach` and is none past it, wherever the layer is cut.
-            let hl = if d < reach && fall > 0.0 {
-                let facing = -(inward.0 * light.0 + inward.1 * light.1);
-                let spec = facing.max(0.0).powf(power) + 0.5 * (-facing).max(0.0).powf(power);
-                (intensity * spec * ((-d / band).exp() - floor) / fall).clamp(0.0, 1.0)
+            let hl = if has_light && d <= reach {
+                let facing = nx * lx + ny * ly;
+                let spec = if facing > 0.0 {
+                    facing.powf(power)
+                } else if facing < 0.0 {
+                    0.5 * (-facing).powf(power)
+                } else {
+                    0.0
+                };
+                if spec > 0.0 { (intensity * spec * ((-d / band).exp() - floor) / fall).clamp(0.0, 1.0) } else { 0.0 }
             } else {
                 0.0
             };
-            let i = (y * w as usize + x) * 4;
-            if let Some(p) = dst.get_mut(i..i + 4) {
+            let dst_idx = index * 4;
+            if let Some(p) = dst.get_mut(dst_idx..dst_idx + 4) {
                 for (o, v) in p.iter_mut().zip(base) {
                     *o = ((v * (1.0 - hl) + 255.0 * hl) * c).round().clamp(0.0, 255.0) as u8;
                 }
@@ -265,6 +476,10 @@ pub fn glass(g: &Glass, shape: &Outline, back: &Pixmap, pad: u32, w: u32, h: u32
     }
     Some(out)
 }
+
+#[cfg(test)]
+#[path = "glass_cache_tests.rs"]
+mod glass_cache_tests;
 
 #[cfg(test)]
 mod tests {

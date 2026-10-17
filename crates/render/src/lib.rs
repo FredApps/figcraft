@@ -87,10 +87,45 @@ fn new_pixmap(w: u32, h: u32) -> Option<Pixmap> {
     Pixmap::new(w, h)
 }
 
-/// The largest backdrop radius (background blur, glass: see [`figcraft_doc::Effect::backdrop_radius`])
-/// in the document (0 without any).
-pub(crate) fn max_backdrop_blur(doc: &Document) -> f64 {
-    doc.nodes().flat_map(|n| n.effects.iter()).map(figcraft_doc::Effect::backdrop_radius).fold(0.0, f64::max)
+/// Layers whose paints/effects may participate in this page render. Deliberately no view culling:
+/// a backdrop can read layers beyond the visible rectangle. Pattern sources are drawn in their
+/// own cell and are tracked separately by the retained renderer.
+pub(crate) fn rendered_nodes<'a>(doc: &'a Document, page: NodeId, opts: &Options) -> Vec<&'a figcraft_doc::Node> {
+    if opts.outline_mode {
+        return Vec::new();
+    }
+    let Some(p) = doc.node(page) else { return Vec::new() };
+    // Match render_view_single: a valid solo layer is drawn independently of its ancestors.
+    let mut stack: Vec<_> = match opts.solo.filter(|id| *id != page && doc.page_of(*id) == Some(page)) {
+        Some(id) => vec![(id, 0)],
+        None => p.children.iter().map(|id| (*id, 0)).collect(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    while let Some((id, depth)) = stack.pop() {
+        if depth > MAX_EXPORT_DEPTH || !seen.insert(id) {
+            continue;
+        }
+        let Some(n) = doc.node(id) else { continue };
+        // Mask content is drawn directly by draw_masked, bypassing the mask node's skip/outline
+        // checks. Including it conservatively also covers its children's effects and paints.
+        if !n.is_mask && (opts.skip.contains(&id) || opts.outlined.contains(&id)) {
+            continue;
+        }
+        if !n.visible || n.opacity <= 0.0 {
+            continue;
+        }
+        out.push(n);
+        if !n.hides_contents() {
+            stack.extend(n.children.iter().map(|c| (*c, depth + 1)));
+        }
+    }
+    out
+}
+
+/// The largest backdrop radius that can participate in a page render (0 without any).
+pub(crate) fn max_backdrop_blur(doc: &Document, page: NodeId, opts: &Options) -> f64 {
+    rendered_nodes(doc, page, opts).iter().flat_map(|n| n.effects.iter()).map(figcraft_doc::Effect::backdrop_radius).fold(0.0, f64::max)
 }
 
 /// How far (device pixels) a background blur of `radius` reads its backdrop at `scale`.
@@ -123,7 +158,7 @@ pub fn render_view(doc: &Document, page: NodeId, view: &View, opts: &Options) ->
 fn render_bands(doc: &Document, page: NodeId, view: &View, opts: &Options, bands: u32) -> Option<Pixmap> {
     use rayon::prelude::*;
     let band_h = view.height.div_ceil(bands.max(1));
-    let overlap = backdrop_reach(max_backdrop_blur(doc), view.scale).ceil();
+    let overlap = backdrop_reach(max_backdrop_blur(doc, page, opts), view.scale).ceil();
     if !overlap.is_finite() || overlap > f64::from(band_h) {
         return None;
     }
@@ -434,6 +469,8 @@ mod band_tests;
 #[cfg(test)]
 mod boolean_cache_tests;
 #[cfg(test)]
+mod effect_composition_tests;
+#[cfg(test)]
 mod effect_order_tests;
 #[cfg(test)]
 mod effects_behaviour_tests;
@@ -457,6 +494,8 @@ mod lod_tests;
 mod paint_behaviour_tests;
 #[cfg(test)]
 mod progressive_tests;
+#[cfg(test)]
+mod render_scope_tests;
 #[cfg(test)]
 mod retained_edit_tests;
 #[cfg(test)]
