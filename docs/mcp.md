@@ -26,6 +26,12 @@ If that connection cannot be established, the error says the request was not sen
 A connection the app closed while it sat idle is noticed before the next request is written and
 replaced then, so a pause between calls is not an error.
 
+The app keeps answering while its window is minimised or covered by other windows (see
+`docs/control-protocol.md`): edits, inspection (`inspect_ui` too), pointer, key and text input and
+renders work as usual (minimised, each request to the app takes up to about 0.1 s). Only a capture
+of the window itself (`screenshot` with `window`) needs it on screen: it is then an error at once;
+`screenshot` without `window` renders the document instead.
+
 ### Confining file access
 
 ```sh
@@ -227,6 +233,8 @@ Or in a project's `.mcp.json`:
   user units, e.g. `{"wght": 550, "wdth": 85}` (`null` = back to what the style name implies);
   `text.setVariations {variations, replace?}` merges instead. `text.fonts {family, style?, axes: true}`
   lists a font's axes and named instances (named instances are also valid `fontStyle` values).
+  `text.missingFonts` lists the families the document names that aren't installed
+  (`{families: [{family, layers}]}`); their text draws in a fallback font.
   OpenType features: `features {"liga": false, "tnum": true}`.
   Decorations: `textDecorationStyle` (`solid`, `dotted`, `wavy`), `textDecorationThickness` and
   `textDecorationOffset` (`auto`, px, or `"10%"` of the font size; the offset runs from the baseline
@@ -875,10 +883,13 @@ path?}` writes this file's collections (default: all but library copies) as a lo
 response (`format: "json"`, the default) or as CSS custom properties (`format: "css"`: the default
 mode on `:root`, each other mode on `[data-<collection>="<mode>"]`, aliases as `var(--name)`), and
 returns `{text}` (or writes `path` and returns `{path}`). `variable.import {variables}` (an object,
-JSON text or a path) reads one back: a collection joins this file's collection of the same name
+JSON text or a path; `variableCollections` and `variables` under `meta` or at the top level) reads
+one back: a collection joins this file's collection of the same name
 (values matched by mode name, new modes and variables added, a same-named variable of another type
 skipped with a warning; library copies and extended collections are never targets), others are
-added; aliases are checked for loops; it returns `{collections, variables, updated, warnings}`. The
+added; aliases are checked for loops; it returns `{collections, variables, updated, warnings}`,
+with a warning when the JSON holds no variables (`no variables found: expected meta.variables …`)
+or fewer than its collections list in `variableIds`. The
 Variables editor's Import… and Export… buttons do the same through file dialogs.
 
 Strokes take colour styles and variables like fills: `style.apply {style, target: "stroke"}` links
@@ -1412,6 +1423,27 @@ through the outlines of its layers.
   clears it; no `preset` reads it). The desktop app reads pressure from pen input on Windows; in the
   browser from stylus touch events that report a force; macOS and Linux tablets report none.
 
+### Selection colors
+
+`selection.colors {ids?}` returns `{colors: [{paint, style, variable, targets}]}` across the
+selection and its descendants, deduplicating overlapping roots. Only visible solid and gradient
+paints are listed; masks and boolean operands are omitted. Styles and variables distinguish
+otherwise equal paints. Each target is `{id, fills, index, range}`; `range` is null for a node
+paint or `[start, end]` in character offsets for an effective text-range fill.
+
+Pass the returned target list to:
+
+- `selection.setPaint {targets, paint}` to replace only those slots (same paint syntax as `fill.set`).
+- `selection.selectColor {targets}` to select their distinct owning layers, without a document undo step.
+- `selection.applyColorStyle {targets, style}` to apply a document paint style. As with `style.apply`,
+  this replaces the matching node's entire fill/stroke list and links the style. Text ranges copy
+  resolved paints and keep their typography, without a paint-style link.
+
+Keep the targets fixed throughout a live interaction. A color becoming equal to another color
+must not add slots to the gesture. Invalid or missing targets fail atomically. Direct paint edits
+detach bindings on changed paint values (opacity alone keeps the color binding); a text-range edit preserves the node bindings other
+characters still inherit. Each mutating command is one undo step (an interaction can group them).
+
 ### Paint, effect and layout grid lists
 
 A layer's fills, strokes, effects and layout grids are lists kept **bottom first**: index 0 paints
@@ -1577,6 +1609,18 @@ the instance's text layer id with `get_node`):
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_command","arguments":{"command":"instance.create","params":{"component":2,"x":500,"y":100}}}}
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"type_text","arguments":{"id":7,"text":"Grace Hopper"}}}
 ```
+
+Smart-selection spacing (movable siblings in rows, columns or aligned grids):
+
+```json
+{"jsonrpc":"2.0","id":"spacing","method":"tools/call","params":{"name":"run_command","arguments":{"command":"arrange.spacing","params":{"ids":[3,4,5],"horizontal":24}}}}
+```
+
+`horizontal` and `vertical` are optional page-unit gaps (at least one is required, magnitude at
+most 1,000,000). The first column/row stays fixed; subsequent tracks move without changing sizes,
+parents or offsets inside each track. Nonuniform gaps become uniform. Normal auto-layout flow
+children, locked/hidden layers and instance internals are excluded. Interactive callers may pass
+`fromGesture: true` inside an interaction to keep using its original tracks during a scrub.
 
 Align and distribute as one undo step:
 

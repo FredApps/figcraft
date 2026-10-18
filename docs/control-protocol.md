@@ -37,11 +37,15 @@ requests still queued after the UI timeout are discarded, including requests def
 window. A command already running is not interrupted.
 
 A minimised or covered window (the main one or another, see Windows below) draws no frames, but
-still answers `engine.execute`, `engine.commands`, `document.inspect`, `node.get`, `window.list`
-and `ui.render`, acting on the file that window shows, so an attached agent can edit, inspect and
-save while the app is out of sight. Screenshots, input (`ui.input`,
-`ui.pointer`, `ui.key`, `ui.type`) and the interface's own state wait for the window to show, and
-time out after 60 s if it doesn't.
+still answers every method that acts on the app's state (`engine.execute`, `document.inspect`,
+`node.get`, `ui.inspect`, `ui.pointer`, `ui.key`, `ui.type`, `ui.set`, `ui.render`, `window.list`,
+…), in the file that window shows, so an attached agent can edit, inspect and save while the app is
+out of sight. The app is not drawn meanwhile and only wakes for requests, at most ten times a
+second while minimised, so a request there takes up to about 0.1 s. What only a drawn frame can
+answer (`ui.screenshot`, `ui.input`, `window.new`) is an error at once (`window 0 is minimised or
+hidden: …`) instead of waiting for the window to show; `ui.render` draws the document without it.
+Under Wayland the app can't tell that its window is minimised: where the compositor then stops
+drawing it, a request waits for the window and gets the 60 s timeout error.
 
 Coordinates are page units, y down. `x`/`y` in `node.set`/`node.create` are relative to the parent
 frame (groups have no coordinate space of their own).
@@ -194,7 +198,8 @@ A mouse gesture with the current tool. `kind`: `down`, `move`, `up`, `click`, `d
 (`x`, `y`) or screen pixels (`sx`, `sy`). `pressure` (0–1) is pen pressure (the Pencil records
 it); a drag's pressure goes from `pressure` to `pressureTo`. Returns `{selection, tool}`. With the Move and Scale
 tools, a press on a frame's or section's name label (as the canvas last drew it, along a rotated
-frame's top edge) selects and drags that frame.
+frame's top edge) selects and drags that frame; a double-click there renames the frame in place in
+the desktop app (the name field opens over the label).
 
 ```json
 {"id":4,"method":"engine.execute","params":{"command":"tool.set","params":{"tool":"ellipse"}}}
@@ -243,12 +248,13 @@ separate calls. Returns `{queued}`.
 
 Invoke a menu item exactly like clicking it (this may open a dialog). Returns `{ok, lastError}`.
 
-### `ui.set {rightTab?, leftTab?, theme?, home?, homeSection?, homeRecentsView?, homeRecentsSort?, homeRecentsOrder?, palette?, mainMenu?, focusRegion?, colorPicker?, variables?, layerFilter?, collapseLayers?, exportPreview?, preview?, presentScroll?, colorProfileDialog?, stylePicker?, stylePickerEdit?, stylePickerView?, iconGallery?, protoEditor?, contextMenu?, contextSelectLayer?, commentOpen?, commentDraft?, commentFilter?, commentSort?, commentSearch?, commentReply?, commentEdit?, presentComments?, devCompare?, devCompareMode?, devCompareSplit?, annotationFilter?, resetFrameStats?, pluginsWindow?, pluginsTab?, pluginConfirm?, pluginForm?}`
+### `ui.set {rightTab?, leftTab?, theme?, home?, homeSection?, homeSearch?, homeRecentsView?, homeRecentsSort?, homeRecentsOrder?, palette?, mainMenu?, focusRegion?, colorPicker?, variables?, layerFilter?, collapseLayers?, exportPreview?, preview?, presentScroll?, colorProfileDialog?, stylePicker?, stylePickerEdit?, stylePickerView?, iconGallery?, protoEditor?, contextMenu?, contextSelectLayer?, commentOpen?, commentDraft?, commentFilter?, commentSort?, commentSearch?, commentReply?, commentEdit?, presentComments?, devCompare?, devCompareMode?, devCompareSplit?, annotationFilter?, resetFrameStats?, pluginsWindow?, pluginsTab?, pluginConfirm?, pluginForm?}`
 
 Switch panels and modes: `rightTab` `design|prototype|inspect`, `leftTab` `file|assets`, `theme`,
 `home` (bool), `homeSection` (`recents`, `online` or `templates`: which section the home screen shows, as `ui.inspect` reports it; opening
 `online` asks each server once what became of your online files), `homeRecentsView` (`grid|list`), `homeRecentsSort` (`modified|name|created`) and `homeRecentsOrder` (`desc|asc`): how the home screen shows its recent files (kept in the preferences; `ui.inspect` reports them under `homeRecents` with each file and whether its picture is in), `palette` (bool: the Actions palette), `mainMenu` (bool, or a top-level menu such
-as `"Plugins"` to open the main menu with it open), `pluginsWindow` (bool: Plugins ▸ Manage
+as `"Plugins"` to open the main menu with it open), `homeSearch` (text, at most 256 characters: filters locally known open, recent and online files plus starter templates in Home; an empty string returns to the selected section),
+`pluginsWindow` (bool: Plugins ▸ Manage
 plugins…), `pluginsTab` (`installed|browse`: that window's tab), `pluginConfirm` (a plugin id of the
 directory listed last: its install confirmation shows, as its Install button would; `null` closes
 it), `pluginForm` (`{id, command?}`: start that plugin command like its menu item, opening
@@ -292,7 +298,8 @@ focus view shows, or `null`) and `annotationFilter`).
 
 PNG of the whole window (`window` picks one), UI included (needs a visible window; an idle one draws the frame to
 capture). Returns `{path, width, height}`, without `path` `{format: "png", width, height, data}`
-(base64), or an error after 60 s when the window doesn't deliver.
+(base64); an error at once when the window is minimised or hidden, or after 60 s when the window
+doesn't deliver.
 
 ### `ui.render {path?, scale?, ids?}`
 
