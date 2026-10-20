@@ -1,6 +1,7 @@
 //! On-canvas text editing: caret, selection, typing. A whole editing session is one undo step.
 
 use figcraft_doc::{Document, ListStyle, NodeId, NodeKind, TextData};
+use figcraft_geom::Point;
 
 use crate::{EngineError, Preedit, Result, Session, TextEdit};
 
@@ -24,8 +25,66 @@ pub fn begin(s: &mut Session, id: NodeId, caret: Option<usize>, created: bool) -
     ds.text_edit = Some(TextEdit { id, caret, anchor, created, preedit: None });
     ds.selection = vec![id];
     ds.revision += 1;
+    comfortable_view(s, id, caret);
     s.live_text_notice(id);
     Ok(())
+}
+
+/// Text smaller than this on screen (px) is too hard to edit: entering it zooms in.
+const EDIT_BELOW_PX: f64 = 10.0;
+/// The on-screen size (px) tiny text is zoomed to.
+const COMFORT_PX: f64 = 24.0;
+/// The most `comfortable_view` zooms in (800%), so very small type still gets a bounded jump.
+const COMFORT_MAX_ZOOM: f64 = 8.0;
+
+/// While a text box is too small to read at the current zoom, start the edit with a zoom in that
+/// keeps the caret where it is, so what you type is always legible (already-legible edits leave
+/// the view alone).
+fn comfortable_view(s: &mut Session, id: NodeId, caret: usize) {
+    let Ok(ds) = s.ds() else { return };
+    let Some(n) = ds.doc.node(id) else { return };
+    let NodeKind::Text(t) = &n.kind else { return };
+    // The type at the caret: a mixed-size layer can be legible at a big run and tiny at a small
+    // one, so the caret's run decides (the last run at the end, where none contains the caret).
+    let font = {
+        let spans = t.spans();
+        spans
+            .iter()
+            .find(|(a, b, _)| *a <= caret && caret < *b)
+            .or_else(|| spans.last())
+            .map_or(t.style.font_size, |(_, _, st)| st.font_size)
+            .clamp(1.0, 1e4)
+    };
+    let zoom = ds.view.zoom;
+    if !font.is_finite() || font * zoom >= EDIT_BELOW_PX {
+        return;
+    }
+    let Some(anchor) = comfort_anchor(ds, id, caret) else { return };
+    let z = (COMFORT_PX / font).min(COMFORT_MAX_ZOOM);
+    if z <= zoom {
+        return;
+    }
+    let Some(ds) = s.ds_mut().ok() else { return };
+    ds.view.set_zoom_at(z, (anchor.x, anchor.y));
+    ds.revision += 1;
+}
+
+/// The page point the comfort zoom keeps fixed: the caret (the box's centre where there is no
+/// layout: an empty box or missing fonts). `None` for a non-text node or a non-finite point.
+fn comfort_anchor(ds: &crate::DocState, id: NodeId, caret: usize) -> Option<Point> {
+    let n = ds.doc.node(id)?;
+    if !matches!(n.kind, NodeKind::Text(_)) {
+        return None;
+    }
+    let anchor = figcraft_text::layout_node(n).map(|(layout, dy)| {
+        let (cx, li) = layout.caret(caret);
+        let mid = layout.lines.get(li).map_or(0.0, |l| l.top + l.height / 2.0);
+        let w = ds.doc.world_transform(id);
+        let q = layout.warp_point(cx, mid);
+        w * Point::new(q.x, q.y + dy)
+    });
+    let anchor = anchor.unwrap_or_else(|| ds.doc.world_transform(id) * Point::new(n.width / 2.0, n.height / 2.0));
+    (anchor.x.is_finite() && anchor.y.is_finite()).then_some(anchor)
 }
 
 /// Finish editing: an empty new text layer is removed; the session becomes one undo step.
@@ -780,6 +839,108 @@ mod tests {
         // The axes query answers without fonts too.
         let r = s.execute("text.fonts", &json!({"family": "Inter", "axes": true})).unwrap();
         assert!(r.is_null() || r["axes"].is_array());
+    }
+
+    fn create(s: &mut Session, text: &str, font: f64) -> NodeId {
+        let r = s.execute("text.create", &json!({"text": text, "x": 10, "y": 10, "props": {"fontSize": font}})).unwrap();
+        crate::params::id_of(&r["id"]).unwrap()
+    }
+
+    #[test]
+    fn small_text_starts_editing_at_a_comfortable_zoom() {
+        // 12pt at 50% is 6px on screen: the edit begins with a zoom in to 24px (200%).
+        let mut s = Session::new();
+        let id = create(&mut s, "jjjj", 12.0);
+        s.execute("view.set", &json!({"zoom": 0.5, "cx": 50, "cy": 50, "vw": 1200, "vh": 800})).unwrap();
+        begin(&mut s, id, Some(0), false).unwrap();
+        let v = &s.ds().unwrap().view;
+        assert!((v.zoom - 2.0).abs() < 1e-9, "zooms to make 12pt 24px on screen, got {}", v.zoom);
+        assert!(v.cx.is_finite() && v.cy.is_finite());
+    }
+
+    #[test]
+    fn an_empty_text_box_starts_editing_at_a_comfortable_zoom() {
+        // A new text box has no layout to anchor on: the fallback (the box's centre) is finite,
+        // and 12pt still zooms in to 24px on screen.
+        let mut s = Session::new();
+        let id = create(&mut s, "", 12.0);
+        s.execute("view.set", &json!({"zoom": 0.25, "cx": 100, "cy": 80})).unwrap();
+        begin(&mut s, id, Some(0), true).unwrap();
+        let v = &s.ds().unwrap().view;
+        assert!((v.zoom - 2.0).abs() < 1e-9, "an empty box zooms in too, got {}", v.zoom);
+        assert!(v.cx.is_finite() && v.cy.is_finite());
+    }
+
+    #[test]
+    fn comfortable_zoom_follows_the_caret_into_a_small_run() {
+        // A 48pt heading with an 8pt detail: the heading is legible at 100%, the detail is not.
+        let mut s = Session::new();
+        let id = create(&mut s, "BIGsmall", 48.0);
+        s.execute("text.style", &json!({"id": id, "start": 3, "end": 8, "fontSize": 8})).unwrap();
+        s.execute("view.set", &json!({"zoom": 1.0, "cx": 50, "cy": 50})).unwrap();
+        begin(&mut s, id, Some(0), false).unwrap();
+        assert!((s.ds().unwrap().view.zoom - 1.0).abs() < 1e-9, "the 48pt run stays as it is");
+        end(&mut s).unwrap();
+        begin(&mut s, id, Some(4), false).unwrap();
+        assert!((s.ds().unwrap().view.zoom - 3.0).abs() < 1e-9, "the 8pt run zooms in to 24px (300%)");
+    }
+
+    #[test]
+    fn legible_text_keeps_the_view_where_it_is() {
+        // 24pt at 100% is already 24px: nothing moves.
+        let mut s = Session::new();
+        let id = create(&mut s, "Hello", 24.0);
+        s.execute("view.set", &json!({"zoom": 1.0, "cx": 40, "cy": 40, "vw": 1200, "vh": 800})).unwrap();
+        begin(&mut s, id, Some(2), false).unwrap();
+        let v = &s.ds().unwrap().view;
+        assert!((v.zoom - 1.0).abs() < 1e-9);
+        assert!((v.cx - 40.0).abs() < 1e-9 && (v.cy - 40.0).abs() < 1e-9);
+        // 12pt at 100% is 12px: small, but readable, so editing doesn't jump the view either.
+        let mut s = Session::new();
+        let id = create(&mut s, "Hello", 12.0);
+        s.execute("view.set", &json!({"zoom": 1.0, "cx": 40, "cy": 40, "vw": 1200, "vh": 800})).unwrap();
+        begin(&mut s, id, Some(2), false).unwrap();
+        let v = &s.ds().unwrap().view;
+        assert!((v.zoom - 1.0).abs() < 1e-9, "12px text is not jumped to 24px, got {}", v.zoom);
+        assert!((v.cx - 40.0).abs() < 1e-9 && (v.cy - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn comfortable_zoom_never_zooms_out_or_past_the_cap() {
+        // Deeply zoomed in: the text is big, the view is untouched.
+        let mut s = Session::new();
+        let id = create(&mut s, "Hi", 12.0);
+        s.execute("view.set", &json!({"zoom": 4.0, "cx": 0, "cy": 0})).unwrap();
+        begin(&mut s, id, Some(0), false).unwrap();
+        assert!((s.ds().unwrap().view.zoom - 4.0).abs() < 1e-9);
+        // 1pt type would need 24x to reach 24px: the cap (8x) wins.
+        let mut s = Session::new();
+        let id = create(&mut s, "a", 1.0);
+        s.execute("view.set", &json!({"zoom": 0.5, "cx": 0, "cy": 0})).unwrap();
+        begin(&mut s, id, Some(0), false).unwrap();
+        assert!((s.ds().unwrap().view.zoom - COMFORT_MAX_ZOOM).abs() < 1e-9);
+        // 1pt at 900% is 9px: still short of the trigger, but already past the comfort cap, so
+        // the zoom stays where it is (the comfort zoom never zooms out).
+        let mut s = Session::new();
+        let id = create(&mut s, "a", 1.0);
+        s.execute("view.set", &json!({"zoom": 9.0, "cx": 0, "cy": 0})).unwrap();
+        begin(&mut s, id, Some(0), false).unwrap();
+        assert!((s.ds().unwrap().view.zoom - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn comfortable_zoom_anchors_the_caret_on_screen() {
+        // The caret's screen position survives the zoom in.
+        let mut s = Session::new();
+        let id = create(&mut s, "abcd", 12.0);
+        s.execute("view.set", &json!({"zoom": 0.5, "cx": 50, "cy": 50, "vw": 1200, "vh": 800})).unwrap();
+        // The anchor the engine uses (the caret's page point).
+        let a = comfort_anchor(s.ds().unwrap(), id, 0).unwrap();
+        let (ax, ay) = (a.x, a.y);
+        let before = s.ds().unwrap().view.page_to_screen(ax, ay);
+        begin(&mut s, id, Some(0), false).unwrap();
+        let after = s.ds().unwrap().view.page_to_screen(ax, ay);
+        assert!((before.0 - after.0).abs() < 1e-6 && (before.1 - after.1).abs() < 1e-6);
     }
 
     /// No text command panics on junk parameters while a text is being edited.

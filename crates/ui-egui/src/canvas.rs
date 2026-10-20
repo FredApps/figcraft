@@ -742,6 +742,40 @@ pub(crate) fn node_quad(app: &FigApp, doc: &Document, id: NodeId) -> Option<[Pos
     }))
 }
 
+/// The card around the text box being edited: the box's quad padded outward by `PAD` screen
+/// points on every edge, so it follows a rotated or skewed box too.
+pub(crate) fn edit_card(app: &FigApp, doc: &Document, id: NodeId) -> Option<[Pos2; 4]> {
+    /// The card's padding around the box (screen points).
+    const PAD: f32 = 8.0;
+    let q = node_quad(app, doc, id)?;
+    let c = q.iter().fold(vec2(0.0, 0.0), |sum, p| sum + p.to_vec2()) / q.len() as f32;
+    // Each edge moves out along its outward normal; a corner is where the two moved edges meet.
+    let normal = |a: Pos2, b: Pos2| {
+        let d = b - a;
+        let len = d.length();
+        if len < 1e-6 {
+            return vec2(0.0, 0.0);
+        }
+        let n = vec2(-d.y, d.x) / len;
+        if n.dot((a + d * 0.5).to_vec2() - c) < 0.0 { -n } else { n }
+    };
+    let mut out = [Pos2::ZERO; 4];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let (prev, cur, next) = (q[(i + 3) % 4], q[i], q[(i + 1) % 4]);
+        let (n1, n2) = (normal(prev, cur), normal(cur, next));
+        let (d1, d2) = (cur - prev, next - cur);
+        let delta = (n2 - n1) * PAD;
+        let den = d1.x * d2.y - d1.y * d2.x;
+        *slot = if den.abs() > 1e-6 {
+            let t = (delta.x * d2.y - delta.y * d2.x) / den;
+            pos2(cur.x, cur.y) + n1 * PAD + d1 * t
+        } else {
+            pos2(cur.x, cur.y) + n1 * PAD
+        };
+    }
+    Some(out)
+}
+
 fn quad(painter: &egui::Painter, q: [Pos2; 4], s: Stroke) {
     painter.add(Shape::closed_line(q.to_vec(), s));
 }
@@ -1089,8 +1123,13 @@ fn overlays(app: &FigApp, painter: &egui::Painter, t: &Tokens) -> Vec<(NodeId, [
         && let Some(text) = TextOnScreen::of(edoc, te.id)
     {
         let layout = &text.layout;
-        if let Some(q) = node_quad(app, edoc, te.id) {
-            quad(painter, q, stroke(accent(painter), 1.0));
+        if let Some(card) = edit_card(app, edoc, te.id) {
+            // The box being edited: a translucent tint with padding and a clear accent border, so
+            // the text you are typing is easy to find on a busy canvas. The fill is translucent
+            // (the canvas, and the text itself, is drawn beneath this overlay): an opaque card
+            // would hide the very text being edited.
+            painter.add(Shape::convex_polygon(card.to_vec(), accent(painter).gamma_multiply(0.12), Stroke::NONE));
+            painter.add(Shape::closed_line(card.to_vec(), stroke(accent(painter), 1.5)));
         }
         let (a, b) = (te.caret.min(te.anchor), te.caret.max(te.anchor));
         if a != b && preedit.is_none() {
