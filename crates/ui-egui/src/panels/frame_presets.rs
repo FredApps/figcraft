@@ -1,5 +1,5 @@
-//! The Frame tool's panel: frame presets by category. Clicking one adds a frame of that size next
-//! to the page's frames and returns to the Move tool.
+//! The Frame tool's panel: New from selection, then frame presets by category. Clicking a preset
+//! adds a frame of that size next to the page's frames; either returns to the Move tool.
 
 use egui::{Align2, CornerRadius, Id, Sense, Ui, pos2, vec2};
 use serde_json::json;
@@ -10,11 +10,24 @@ use crate::icons::{self, Icon};
 use crate::theme::{Tokens, regular, semibold};
 use crate::widgets::{self, PAD};
 
-/// Draw the expandable frame-preset categories; choosing a preset runs `frame.create`,
-/// switches to the Move tool and zooms to the new selection.
+/// Draw New from selection and the expandable frame-preset categories. New from selection wraps
+/// the selected layers in a frame (`object.frameSelection`, #1683); choosing a preset runs
+/// `frame.create` and zooms to the new selection. Both switch to the Move tool.
 pub fn panel(app: &mut FigApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     widgets::section_header(ui, tr("Frame"), &[], false);
+    let selected = app.session.ds().is_ok_and(|ds| !ds.selection.is_empty());
+    let mut from_selection = false;
+    ui.horizontal(|ui| {
+        ui.add_space(PAD);
+        from_selection = widgets::button(ui, tr("New from selection"), false, selected).clicked();
+    });
+    ui.add_space(4.0);
+    if from_selection {
+        app.run("object.frameSelection", json!({}));
+        app.run("tool.set", json!({"tool": "move"}));
+        return;
+    }
     let w = ui.available_width();
     let mut cats: Vec<&str> = Vec::new();
     for (c, ..) in figcraft_engine::cmd::create::FRAME_PRESETS {
