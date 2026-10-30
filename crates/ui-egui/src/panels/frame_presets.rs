@@ -2,13 +2,21 @@
 //! adds a frame of that size next to the page's frames; either returns to the Move tool.
 
 use egui::{Align2, CornerRadius, Id, Sense, Ui, pos2, vec2};
+use figcraft_doc::{Document, NodeId, NodeKind};
 use serde_json::json;
 
 use crate::FigApp;
+use crate::a11y;
 use crate::i18n::tr;
 use crate::icons::{self, Icon};
 use crate::theme::{Tokens, regular, semibold};
 use crate::widgets::{self, PAD};
+
+/// Whether `object.frameSelection` would frame `selection`: layers on a page, none of them a
+/// section (sections never go in frames, #1683).
+fn can_frame(doc: &Document, selection: &[NodeId]) -> bool {
+    !selection.is_empty() && selection.iter().all(|i| doc.node(*i).is_some_and(|n| n.parent.is_some() && !matches!(n.kind, NodeKind::Section { .. })))
+}
 
 /// Draw New from selection and the expandable frame-preset categories. New from selection wraps
 /// the selected layers in a frame (`object.frameSelection`, #1683); choosing a preset runs
@@ -16,15 +24,19 @@ use crate::widgets::{self, PAD};
 pub fn panel(app: &mut FigApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     widgets::section_header(ui, tr("Frame"), &[], false);
-    let selected = app.session.ds().is_ok_and(|ds| !ds.selection.is_empty());
+    let framable = app.session.ds().is_ok_and(|ds| can_frame(&ds.doc, &ds.selection));
     let mut from_selection = false;
     ui.horizontal(|ui| {
         ui.add_space(PAD);
-        from_selection = widgets::button(ui, tr("New from selection"), false, selected).clicked();
+        let resp = widgets::button(ui, tr("New from selection"), false, framable);
+        if !framable {
+            a11y::disabled(&resp);
+        }
+        from_selection = resp.clicked();
     });
     ui.add_space(4.0);
-    if from_selection {
-        app.run("object.frameSelection", json!({}));
+    // The Frame tool stays when framing failed (its error is shown).
+    if from_selection && app.run("object.frameSelection", json!({})).is_some() {
         app.run("tool.set", json!({"tool": "move"}));
         return;
     }
