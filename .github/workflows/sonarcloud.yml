@@ -1,26 +1,30 @@
-name: SonarCloud
-
+name: Fig native U16 thumbnail integrated renderer validation
 on:
-  push:
-    branches: [main]
-  pull_request:
-    types: [opened, synchronize, reopened]
-
+  workflow_dispatch:
 permissions:
   contents: read
-
 concurrency:
-  group: sonarcloud-${{ github.ref }}
-  # A push to main is the run that publishes coverage; superseded runs there would never finish.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
+  group: fig-u16-integrated-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  sonarcloud:
-    # Pin the coverage setup that provisions test data and fetches locked dependencies before offline metadata tests.
-    uses: storytold/craft-common-actions/.github/workflows/sonarcloud.yml@5008f8cd1b011b35eed223a7d058d7a8e9075ef6
+  render:
+    if: github.repository == 'FredApps/figcraft' && github.ref == 'refs/heads/diag/778-u16-integrated-11bfa4db'
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@ecb64b2acb8731f0e2eb8f55fd2f45424bef75d0
     with:
-      # The shared coverage archive's shards omit the CLI executable used by integration tests.
-      # Run this repository's suite in one instrumented job and provide its pinned test data.
-      shards: 1
-      fonts-ref: 37827adc41fd165f9a9234ac40f94dbad353aa69
-    secrets: inherit
+      os: '["ubuntu-24.04", "windows-latest"]'
+      select-os: '[]'
+      timeout-minutes: 20
+      gate-timeout-minutes: 18
+      tools: ''
+      targets: ''
+      craft-fonts-ref: ''
+      require-craft-fonts: false
+      cache-name: fig-svg-pin-scoped
+      command: |
+        git fetch --no-tags origin cc94e8de9fdcc536c758b1cc29da120efd0b8eef
+        git diff --exit-code cc94e8de9fdcc536c758b1cc29da120efd0b8eef HEAD -- . ':(exclude).github/workflows/sonarcloud.yml'
+        echo 'Scoped Fig render unit/doctests and all-target lint only, not a full-workspace or WASM gate. Runtime is estimated below 20 minutes from the prior four-package Windows run including render; this tests the combined source tree with current main, not the earlier PR dependency graph.'
+        cargo fmt -p figcraft-render -- --check
+        cargo test --locked -p figcraft-render
+        cargo clippy --locked -p figcraft-render --all-targets -- -D warnings
+        git diff --exit-code -- Cargo.lock
